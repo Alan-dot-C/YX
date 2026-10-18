@@ -48,8 +48,8 @@ Response:
 ```json
 {"v":"1","id":"c1","ok":true,"op":"status","tool":"yx","version":"0.1.0",
  "server":true,"pid":1234,"uptime_ms":890,"clients":1,"frames":1,
- "pipe":"\\\\.\\pipe\\yx-Administrator",
- "data_dir":"C:\\Users\\Administrator\\AppData\\Local\\yx"}
+ "pipe":"\\\\.\\pipe\\yx-<user>",
+ "data_dir":"%LOCALAPPDATA%\\yx"}
 ```
 
 If the server is not running, the CLI returns a local object with
