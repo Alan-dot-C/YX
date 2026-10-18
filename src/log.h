@@ -60,6 +60,26 @@ void LogShutdown();
 // 必须在 LogInit() 之前调用。默认是 handeye；yx 传入 yx。
 void LogSetApp(const std::wstring& name);
 
+// 哈希链：只给账本进程开（yx serve / yx log）。默认关，handeye 的日志不带链。
+void LogEnableChain(bool enabled);
+bool LogChainEnabled();
+
+// 校验结果：ok=false 时 file/line/expected/actual 指向第一个不匹配处。
+struct LogVerifyResult {
+    bool         ok = false;
+    bool         headOk = false;
+    int          chained = 0;
+    int          unverified = 0;
+    std::wstring file;
+    int          line = 0;
+    std::wstring expected;
+    std::wstring actual;
+    std::wstring error;
+};
+
+// 从最早的轮转文件到活动文件重算链，再和 logs\head 比对。
+LogVerifyResult LogVerify();
+
 // 命令行覆盖（在 LogInit 之后调用）。只覆盖传入的项。
 // hasDir/hasLevel/hasText/hasEnabled 为 false 表示这一项不改。
 void LogConfigure(bool hasDir, const std::wstring& dir,

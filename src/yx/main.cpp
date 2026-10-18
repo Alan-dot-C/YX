@@ -785,6 +785,54 @@ static int CmdZoom(int argc, wchar_t** argv) {
     return 0;
 }
 
+static int CmdLogWrite(int argc, wchar_t** argv) {
+    std::wstring dir = GetOpt(argc, argv, L"--dir");
+    if (!dir.empty()) LogConfigure(true, dir, false, 0, false, 0, false, true);
+
+    LogI(L"测试", 9001, L"测试", L"测试事件", L"n=%d", 1);
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"log.write").Bool(L"ok", true);
+    d.Str(L"path", LogFilePath());
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 0;
+}
+
+static int CmdLogVerify(int argc, wchar_t** argv) {
+    std::wstring dir = GetOpt(argc, argv, L"--dir");
+    if (!dir.empty()) LogConfigure(true, dir, false, 0, false, 0, false, true);
+
+    LogVerifyResult r = LogVerify();
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"log.verify").Bool(L"ok", r.ok);
+    d.Int(L"chained", r.chained).Int(L"unverified", r.unverified).Bool(L"head_ok", r.headOk);
+    if (!r.ok) {
+        d.Int(L"rc", 5).Str(L"error", r.error);
+        if (!r.file.empty()) d.Str(L"file", r.file);
+        if (r.line > 0) d.Int(L"line", r.line);
+        if (!r.expected.empty()) d.Str(L"expected", r.expected);
+        if (!r.actual.empty()) d.Str(L"actual", r.actual);
+    }
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return r.ok ? 0 : 5;
+}
+
+static int CmdLog(int argc, wchar_t** argv) {
+    std::wstring sub = argc > 2 ? argv[2] : L"verify";
+    sub = ToUpper(sub);
+    if (sub == L"WRITE") return CmdLogWrite(argc, argv);
+    if (sub == L"VERIFY" || sub.empty()) return CmdLogVerify(argc, argv);
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"log").Bool(L"ok", false);
+    d.Int(L"rc", 1).Str(L"error", L"unknown subcommand: " + sub);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 1;
+}
+
+
+
 // ------------------------------ 入口 ------------------------------
 
 static void PrintUsage() {
@@ -794,22 +842,28 @@ static void PrintUsage() {
     wprintf(L"  yx status                         问常驻进程要状态（没开就本地回一份）\n");
     wprintf(L"  yx framing [--level L0|L1|L2]     取一帧；默认 L0\n");
     wprintf(L"  yx zoom --ref <ref>               按 ref 回 L2，不重新截屏\n");
+    wprintf(L"  yx log verify [--dir <目录>]      校验账本哈希链和 head 锚\n");
     wprintf(L"  yx help                           这份帮助\n\n");
     wprintf(L"管道协议：u32 长度前缀 + UTF-8 JSON\n");
-    wprintf(L"退出码：0 成功 / 1 参数错误 / 3 采集失败 / 4 ref 过期 / 6 服务未就绪\n");
+    wprintf(L"退出码：0 成功 / 1 参数错误 / 3 采集失败 / 4 ref 过期 / 5 校验失败 / 6 服务未就绪\n");
 }
 
 int wmain(int argc, wchar_t** argv) {
     InitConsoleUtf8();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    // 两个程序共用一个日志模块，账本要分开：配置目录、日志目录、锁名、文件名
-    // 全部跟着程序名走。不这么做，客户端一跑就会往 handeye 的目录里写东西。
-    LogSetApp(L"yx");
-    LogInit();
-    g_startTick = GetTickCount();
 
     std::wstring cmd = argc > 1 ? argv[1] : L"";
     for (wchar_t& c : cmd) c = towlower(c);
+
+    // 只有服务端和 log 命令写账本；普通客户端写 yx-client.log，不污染链。
+    if (cmd == L"serve" || cmd == L"log") {
+        LogSetApp(L"yx");
+        LogEnableChain(true);
+    } else {
+        LogSetApp(L"yx-client");
+    }
+    LogInit();
+    g_startTick = GetTickCount();
 
     int rc = 0;
     if (cmd.empty() || cmd == L"help" || cmd == L"--help" || cmd == L"-h") {
@@ -822,6 +876,8 @@ int wmain(int argc, wchar_t** argv) {
         rc = CmdFraming(argc, argv);
     } else if (cmd == L"zoom") {
         rc = CmdZoom(argc, argv);
+    } else if (cmd == L"log") {
+        rc = CmdLog(argc, argv);
     } else {
         Say(L"未知命令: %ls", cmd.c_str());
         PrintUsage();

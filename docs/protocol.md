@@ -127,6 +127,24 @@ them.
 | 4 | ref expired or request timed out |
 | 6 | server not running (client-side only) |
 
+## Ledger (CLI only in v0.1)
+
+```powershell
+yx log verify
+yx log verify --dir C:\path\to\logs
+```
+
+Output:
+
+```json
+{"v":"1","tool":"yx","op":"log.verify","ok":true,
+ "chained":3,"unverified":0,"head_ok":true}
+```
+
+On the first mismatch it returns exit code **5** and fills `file`, `line`,
+`expected`, `actual`, and `error` (`chain mismatch`, `head mismatch`, or
+`head missing`). There is no pipe operation for verification yet.
+
 ## Notes
 
 - The protocol is intentionally small. Additions must be backward compatible:

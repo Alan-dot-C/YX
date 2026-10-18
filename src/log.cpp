@@ -38,6 +38,12 @@ static std::wstring g_lockName = L"Global\\handeye_log_mutex";
 // 否则用同一个模块的第二个程序会把文件写进 handeye 的目录里。
 static std::wstring g_app = L"handeye";
 
+// 哈希链状态。只在 g_chainEnabled 时使用；g_chainReady 表示已从盘上恢复。
+static bool     g_chainEnabled = false;
+static bool     g_chainReady = false;
+static uint64_t g_chain = 0xCBF29CE484222325ULL;
+static int      g_chainLines = 0;
+
 // 飞行记录器：最近 N 条已格式化行，崩溃时落盘
 static const size_t kFlightRecords = 20;
 static std::deque<std::wstring> g_flight;
@@ -62,6 +68,15 @@ void LogSetApp(const std::wstring& name) {
 
 std::wstring LogDefaultDir() { return LogDirFromEnv() + L"\\logs"; }
 std::wstring LogFilePath() { return g_logPath; }
+
+void LogEnableChain(bool enabled) {
+    g_chainEnabled = enabled;
+    g_chainReady = false;
+    g_chain = 0xCBF29CE484222325ULL;
+    g_chainLines = 0;
+}
+
+bool LogChainEnabled() { return g_chainEnabled; }
 
 const std::wstring& LogSessionId() { return g_session; }
 DWORD LogStartTick() { return g_startTick; }
@@ -185,13 +200,134 @@ static void LoadConfigEnv() {
     }
 }
 
+// ------------------------------ 哈希链 ------------------------------
+
+static uint64_t Fnv1a64(uint64_t h, const std::string& s) {
+    for (unsigned char c : s) {
+        h ^= (uint64_t)c;
+        h *= 0x100000001B3ULL;
+    }
+    return h;
+}
+
+static std::wstring Hex16(uint64_t v) {
+    wchar_t buf[32] = {};
+    swprintf_s(buf, L"%016llX", (unsigned long long)v);
+    return buf;
+}
+
+static std::wstring HeadPath() { return g_log.dir + L"\\head"; }
+
+// 一行尾部是 " chain=XXXXXXXXXXXXXXXX" 时，拆出正文和链值。
+static bool ParseChainSuffix(const std::wstring& line, std::wstring& body, uint64_t& value) {
+    static const std::wstring marker = L" chain=";
+    size_t p = line.rfind(marker);
+    if (p == std::wstring::npos) return false;
+    std::wstring hex = line.substr(p + marker.size());
+    if (hex.size() != 16) return false;
+    for (wchar_t c : hex) {
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F')))
+            return false;
+    }
+    body = line.substr(0, p);
+    value = _wcstoui64(hex.c_str(), nullptr, 16);
+    return true;
+}
+
+static bool ReadWholeFile(const std::wstring& path, std::wstring& out) {
+    out.clear();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz > 0) {
+        std::string bytes(size_t(sz), '\0');
+        size_t got = fread(&bytes[0], 1, size_t(sz), f);
+        bytes.resize(got);
+        out = FromUtf8(bytes);
+    }
+    fclose(f);
+    return true;
+}
+
+static void WriteHeadLocked() {
+    if (!g_chainEnabled) return;
+    std::wstring text = L"{\"v\":1,\"file\":\"" + g_log.fileName +
+                        L"\",\"lines\":" + std::to_wstring(g_chainLines) +
+                        L",\"chain\":\"" + Hex16(g_chain) + L"\"}\r\n";
+    std::wstring tmp = HeadPath() + L".tmp";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0 || !f) return;
+    std::string utf8 = ToUtf8(text);
+    fwrite(utf8.data(), 1, utf8.size(), f);
+    fflush(f);
+    fclose(f);
+    MoveFileExW(tmp.c_str(), HeadPath().c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+static bool ReadHead(int& lines, uint64_t& chain) {
+    std::wstring text;
+    if (!ReadWholeFile(HeadPath(), text)) return false;
+    size_t p = text.find(L"\"lines\":");
+    if (p == std::wstring::npos) return false;
+    lines = _wtoi(text.c_str() + p + 8);
+    p = text.find(L"\"chain\":\"");
+    if (p == std::wstring::npos) return false;
+    std::wstring hex = text.substr(p + 9, 16);
+    if (hex.size() != 16) return false;
+    chain = _wcstoui64(hex.c_str(), nullptr, 16);
+    return true;
+}
+
+// 在已经持有日志互斥体时调用：从盘上恢复链尾，只做一次。
+static void LoadChainLocked() {
+    if (!g_chainEnabled || g_chainReady) return;
+    g_chainReady = true;
+    g_chain = 0xCBF29CE484222325ULL;
+    g_chainLines = 0;
+
+    int headLines = 0;
+    uint64_t headChain = 0;
+    bool hasHead = ReadHead(headLines, headChain);
+
+    LogCloseFile();
+    std::wstring text;
+    if (ReadWholeFile(g_logPath, text)) {
+        for (auto& raw : Split(text, L'\n')) {
+            std::wstring line = raw;
+            while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n')) line.pop_back();
+            std::wstring body;
+            uint64_t v = 0;
+            if (ParseChainSuffix(line, body, v)) {
+                g_chain = v;
+                if (!hasHead) ++g_chainLines;
+            }
+        }
+    }
+
+    if (hasHead) {
+        g_chainLines = headLines;
+        g_chain = headChain;
+    }
+}
+
+// 只算链、不改盘；调用方写成功后再 WriteHeadLocked()。
+static void ChainLineLocked(std::wstring& line) {
+    if (!g_chainEnabled) return;
+    if (!g_chainReady) LoadChainLocked();
+    g_chain = Fnv1a64(g_chain, ToUtf8(line));
+    ++g_chainLines;
+    line += L" chain=" + Hex16(g_chain);
+}
+
 // ------------------------------ 旋转 ------------------------------
 
 // 在持有互斥体的情况下调用。把活动文件改名成带时间戳的名字，并裁剪旧文件。
 static void RotateLocked() {
     if (!g_file) return;
     std::wstring dir = g_log.dir;
-    std::wstring base = dir + L"\\handeye";
+    std::wstring base = dir + L"\\" + g_app;
     std::wstring rolled = base + L"_" + NowFileStamp() + L".log";
 
     fclose(g_file);
@@ -243,10 +379,12 @@ static void RotateLocked() {
         std::wstring line = NowStamp();
         line += L" | 信息 | 配置 | 7002 | 数据 | 日志滚动 | ";
         line += detail;
+        if (g_chainEnabled) ChainLineLocked(line);
         line += L"\r\n";
         std::string utf8 = ToUtf8(line);
         fwrite(utf8.data(), 1, utf8.size(), g_file);
         fflush(g_file);
+        if (g_chainEnabled) WriteHeadLocked();
     }
 }
 
@@ -267,6 +405,8 @@ static void FlightPush(const std::wstring& line) {
 // 不加锁直接写一行（崩溃路径用，避免死锁）
 static void WriteRawNoLock(const std::wstring& line) {
     if (!g_log.enabled) return;
+    // 崩溃路径拿不到互斥体，也拿不到链尾；开了链就宁可不写，绝不写一串断链。
+    if (g_chainEnabled) return;
     MakeDirTree(g_log.dir);
     FILE* f = _wfsopen(g_logPath.c_str(), L"ab", _SH_DENYNO);
     if (!f) return;
@@ -312,9 +452,6 @@ void LogWrite(int level, const wchar_t* source, int eventId,
     line += (desc && desc[0]) ? desc : L"";
     line += L" | ";
     line += fullDetail;
-    line += L"\r\n";
-
-    FlightPush(line);
 
     // 会话互斥：多进程同时写时不撕裂
     bool locked = false;
@@ -323,6 +460,8 @@ void LogWrite(int level, const wchar_t* source, int eventId,
         locked = (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED);
     }
 
+    // 链值必须在锁内从盘上恢复；否则两个进程会拿到同一个链尾。
+    if (g_chainEnabled) LoadChainLocked();
     EnsureFileOpen();
     if (g_file) {
         if (g_log.maxFileBytes > 0) {
@@ -330,9 +469,13 @@ void LogWrite(int level, const wchar_t* source, int eventId,
             if (pos >= g_log.maxFileBytes) RotateLocked();
         }
         if (g_file) {
+            if (g_chainEnabled) ChainLineLocked(line);
+            line += L"\r\n";
+            FlightPush(line);
             std::string utf8 = ToUtf8(line);
             fwrite(utf8.data(), 1, utf8.size(), g_file);
             fflush(g_file);
+            if (g_chainEnabled) WriteHeadLocked();
         }
     }
 
@@ -477,6 +620,9 @@ void LogInit() {
 
     if (g_log.dir.empty()) g_log.dir = LogDefaultDir();
     g_logPath = g_log.dir + L"\\" + g_log.fileName;
+    g_chainReady = false;
+    g_chainLines = 0;
+    g_chain = 0xCBF29CE484222325ULL;
 
     if (!g_log.enabled) return;
 
@@ -512,6 +658,9 @@ void LogConfigure(bool hasDir, const std::wstring& dir,
     if (dirChanged && g_log.enabled) {
         if (g_file) { fclose(g_file); g_file = nullptr; }
         g_logPath = g_log.dir + L"\\" + g_log.fileName;
+        g_chainReady = false;
+        g_chainLines = 0;
+        g_chain = 0xCBF29CE484222325ULL;
         MakeDirTree(g_log.dir);
         EnsureFileOpen();
     }
@@ -558,7 +707,7 @@ std::vector<LogRecord> LogReadAll(int maxRecords) {
     std::vector<std::wstring> files;
 
     WIN32_FIND_DATAW fd;
-    std::wstring pattern = g_log.dir + L"\\handeye_*.log";
+    std::wstring pattern = g_log.dir + L"\\" + g_app + L"_*.log";
     HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
@@ -590,6 +739,91 @@ std::vector<LogRecord> LogReadAll(int maxRecords) {
         }
     }
     return out;
+}
+
+// ------------------------------ 校验 ------------------------------
+
+LogVerifyResult LogVerify() {
+    LogVerifyResult r;
+    LogCloseFile();
+
+    std::vector<std::wstring> files;
+    WIN32_FIND_DATAW fd;
+    std::wstring pattern = g_log.dir + L"\\" + g_app + L"_*.log";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                files.push_back(g_log.dir + L"\\" + fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(files.begin(), files.end());
+    files.push_back(g_logPath);
+
+    uint64_t prev = 0xCBF29CE484222325ULL;
+    int chained = 0;
+    int unverified = 0;
+
+    for (const auto& path : files) {
+        std::wstring text;
+        if (!ReadWholeFile(path, text)) continue;
+        int lineNo = 0;
+        for (auto& raw : Split(text, L'\n')) {
+            ++lineNo;
+            std::wstring line = raw;
+            while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n')) line.pop_back();
+            if (line.empty()) continue;
+
+            std::wstring body;
+            uint64_t actual = 0;
+            if (!ParseChainSuffix(line, body, actual)) {
+                ++unverified;
+                continue;
+            }
+
+            uint64_t expected = Fnv1a64(prev, ToUtf8(body));
+            if (expected != actual) {
+                r.ok = false;
+                r.file = path;
+                r.line = lineNo;
+                r.expected = Hex16(expected);
+                r.actual = Hex16(actual);
+                r.error = L"chain mismatch";
+                r.chained = chained;
+                r.unverified = unverified;
+                return r;
+            }
+            prev = actual;
+            ++chained;
+        }
+    }
+
+    r.chained = chained;
+    r.unverified = unverified;
+
+    int headLines = 0;
+    uint64_t headChain = 0;
+    if (ReadHead(headLines, headChain)) {
+        r.headOk = (headLines == chained && headChain == prev);
+        if (!r.headOk) {
+            r.ok = false;
+            r.error = L"head mismatch";
+            r.expected = L"lines=" + std::to_wstring(headLines) + L" chain=" + Hex16(headChain);
+            r.actual = L"lines=" + std::to_wstring(chained) + L" chain=" + Hex16(prev);
+            return r;
+        }
+    } else {
+        r.headOk = false;
+        if (chained > 0) {
+            r.ok = false;
+            r.error = L"head missing";
+            return r;
+        }
+    }
+
+    r.ok = true;
+    return r;
 }
 
 // ------------------------------ 事件目录 ------------------------------
