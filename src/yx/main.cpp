@@ -14,17 +14,26 @@
 // ============================================================================
 #include "../common.h"
 #include "../log.h"
+#include "../eye.h"
+#include "../sieve.h"
+#include "../uia.h"
+#include "../winenum.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <string>
 #include <deque>
+#include <map>
+#include <set>
+#include <vector>
 #include <mutex>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <cwctype>
 
+#include <winrt/base.h>
 #include <sddl.h>
 
 #define YX_VERSION L"0.1.0"
@@ -95,10 +104,329 @@ static std::wstring JsonField(const std::wstring& json, const wchar_t* key) {
     return json.substr(p, e - p);
 }
 
+// ------------------------------ 帧缓存与投影 ------------------------------
+//
+// 一次采集，三种投影。L0/L1/L2 都从这里出，zoom 只查缓存，不重新截屏。
+// 所有状态都在 worker 线程手里，所以不需要锁。
+
+struct CachedFrame {
+    std::wstring ref;
+    DWORD        at = 0;
+    OcrResult    ocr;
+    SieveResult  sieve;
+    std::vector<UiNode> ui;
+};
+
+static std::map<std::wstring, CachedFrame> g_frames;
+static std::map<std::wstring, std::wstring> g_lastRef;
+static unsigned g_refSeq = 0;
+static const size_t kMaxFrames = 16;
+
+static std::wstring NextRef() {
+    wchar_t buf[16] = {};
+    swprintf_s(buf, L"%08x", ++g_refSeq);
+    return buf;
+}
+
+static std::wstring RectJson(const RectI& r) {
+    wchar_t buf[128] = {};
+    swprintf_s(buf, L"{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}", r.x, r.y, r.w, r.h);
+    return buf;
+}
+
+static std::wstring LinesJson(const std::vector<OcrLine>& lines) {
+    std::wstring s = L"[";
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (i) s += L",";
+        const OcrLine& l = lines[i];
+        s += L"{\"text\":\"" + JsonStr(l.text) + L"\"";
+        s += L",\"x\":" + std::to_wstring(l.box.x);
+        s += L",\"y\":" + std::to_wstring(l.box.y);
+        s += L",\"w\":" + std::to_wstring(l.box.w);
+        s += L",\"h\":" + std::to_wstring(l.box.h);
+        s += L",\"q\":" + std::to_wstring((int)(l.quality * 100.0));
+        s += L",\"src\":\"" + JsonStr(l.src) + L"\"}";
+    }
+    s += L"]";
+    return s;
+}
+
+static std::wstring UiJson(const std::vector<UiNode>& nodes) {
+    std::wstring s = L"[";
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        if (i) s += L",";
+        const UiNode& n = nodes[i];
+        s += L"{\"name\":\"" + JsonStr(n.name) + L"\"";
+        s += L",\"role\":\"" + JsonStr(n.role) + L"\"";
+        s += L",\"value\":\"" + JsonStr(n.value) + L"\"";
+        s += L",\"x\":" + std::to_wstring(n.rect.x);
+        s += L",\"y\":" + std::to_wstring(n.rect.y);
+        s += L",\"w\":" + std::to_wstring(n.rect.w);
+        s += L",\"h\":" + std::to_wstring(n.rect.h);
+        s += n.invokable ? L",\"invokable\":true" : L",\"invokable\":false";
+        s += L"}";
+    }
+    s += L"]";
+    return s;
+}
+
+static std::wstring WindowsJson(const std::vector<WinInfo>& wins) {
+    std::wstring s = L"[";
+    for (size_t i = 0; i < wins.size(); ++i) {
+        if (i) s += L",";
+        const WinInfo& w = wins[i];
+        s += L"{\"title\":\"" + JsonStr(w.title) + L"\"";
+        s += L",\"x\":" + std::to_wstring(w.rect.x);
+        s += L",\"y\":" + std::to_wstring(w.rect.y);
+        s += L",\"w\":" + std::to_wstring(w.rect.w);
+        s += L",\"h\":" + std::to_wstring(w.rect.h);
+        s += L",\"z\":" + std::to_wstring(w.z);
+        s += L"}";
+    }
+    s += L"]";
+    return s;
+}
+
+static std::wstring AlarmsJson(const std::vector<std::wstring>& alarms) {
+    std::wstring s = L"[";
+    for (size_t i = 0; i < alarms.size(); ++i) {
+        if (i) s += L",";
+        s += L"\"" + JsonStr(alarms[i]) + L"\"";
+    }
+    s += L"]";
+    return s;
+}
+
+static std::wstring Truncate(const std::wstring& s, size_t n) {
+    if (s.size() <= n) return s;
+    return s.substr(0, n) + L"…";
+}
+
+static CachedFrame CaptureFrame() {
+    CachedFrame f;
+    f.ref = NextRef();
+    f.at = GetTickCount();
+
+    OcrRequest req;
+    req.merge = true;
+    req.padPx = 8;
+    f.ocr = EyeRecognize(req);
+
+    SieveOptions so;
+    so.keepAll = true;       // 报警抽取必须在裁剪前完成
+    so.doDelta = false;      // 变化由我们自己按 key 计算
+    so.maxLines = 100000;
+    so.maxLineChars = 100000;
+    f.sieve = SieveRun(f.ocr.lines, so);
+
+    if (UiInit()) {
+        f.ui = UiTree(nullptr, 8, 600, 400);
+    }
+    return f;
+}
+
+static bool HasErrorWord(const std::wstring& text) {
+    static const wchar_t* kWords[] = {
+        L"错误", L"失败", L"警告", L"无法", L"拒绝", L"异常",
+        L"ERROR", L"FAILED", L"DENIED", L"WARNING",
+    };
+    std::wstring upper = ToUpper(text);
+    for (const wchar_t* w : kWords) {
+        if (upper.find(w) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+static std::vector<std::wstring> CollectAlarms(const CachedFrame& f) {
+    std::vector<std::wstring> out;
+    std::set<std::wstring> seen;
+
+    auto add = [&](const std::wstring& s) {
+        std::wstring t = Trim(s);
+        if (t.empty() || !seen.insert(t).second) return;
+        if (out.size() < 8) out.push_back(t);
+    };
+
+    for (const auto& b : f.sieve.blocks) {
+        // 对话框本身就是报警：里面的控件全部保留
+        if (b.kind == L"dialog") {
+            for (const auto& it : b.items) add(it.text);
+        }
+        for (const auto& it : b.items) {
+            if (HasErrorWord(it.text)) add(it.text);
+        }
+    }
+    for (const auto& n : f.ui) {
+        if (n.invokable && HasErrorWord(n.name)) add(n.name);
+    }
+    return out;
+}
+
+static int CountActions(const CachedFrame& f) {
+    std::set<std::wstring> seen;
+    for (const auto& n : f.ui) {
+        if (!n.invokable || n.offscreen) continue;
+        wchar_t key[320] = {};
+        swprintf_s(key, L"%ls|%d,%d,%d,%d", n.name.c_str(),
+                   n.rect.x, n.rect.y, n.rect.w, n.rect.h);
+        seen.insert(key);
+    }
+    for (const auto& b : f.sieve.blocks) {
+        if (b.kind != L"button") continue;
+        for (const auto& it : b.items) {
+            wchar_t key[320] = {};
+            swprintf_s(key, L"%ls|%d,%d,%d,%d", it.text.c_str(),
+                       it.box.x, it.box.y, it.box.w, it.box.h);
+            seen.insert(key);
+        }
+    }
+    return (int)seen.size();
+}
+
+static std::wstring FrameTitle(const CachedFrame& f) {
+    for (const auto& w : f.sieve.windows) {
+        if (!w.title.empty()) return w.title;
+    }
+    return GetForegroundTitle();
+}
+
+static std::wstring FrameType(const CachedFrame& f) {
+    for (const auto& b : f.sieve.blocks) {
+        if (b.kind == L"dialog") return L"对话框";
+    }
+    if (f.sieve.windows.empty()) return L"桌面";
+    return L"窗口";
+}
+
+static std::wstring Zone(const RectI& r) {
+    RectI scr = EyeScreenRect();
+    if (scr.w <= 0 || scr.h <= 0) return L"未知";
+    int cx = r.cx() * 3 / scr.w;
+    int cy = r.cy() * 3 / scr.h;
+    if (cx < 0) cx = 0;
+    if (cx > 2) cx = 2;
+    if (cy < 0) cy = 0;
+    if (cy > 2) cy = 2;
+    static const wchar_t* rows[] = { L"上", L"中", L"下" };
+    static const wchar_t* cols[] = { L"左", L"中", L"右" };
+    if (cy == 1 && cx == 1) return L"中央";
+    return std::wstring(rows[cy]) + cols[cx];
+}
+
+static std::wstring BuildL0(const CachedFrame& f, const std::vector<std::wstring>& alarms,
+                            const std::wstring& delta) {
+    std::wstring type = FrameType(f);
+    std::wstring title = Truncate(FrameTitle(f), 40);
+    if (title.empty()) title = L"（无标题）";
+
+    std::wstring summary;
+    if (!f.ocr.ok) summary = L"看不清屏幕";
+    else if (!alarms.empty()) summary = L"有 " + std::to_wstring(alarms.size()) + L" 条报警";
+    else if (type == L"对话框") summary = L"对话框已打开";
+    else summary = L"无错误";
+
+    std::wstring out = L"[L0] " + type + L"「" + title + L"」| 可操作 " +
+                       std::to_wstring(CountActions(f)) + L" 项 | " + summary;
+    if (delta.find(L"\"changed\":true") != std::wstring::npos) out += L" | 有变化";
+
+    for (size_t i = 0; i < alarms.size() && i < 2; ++i) {
+        out += L"\n[报警] " + Truncate(alarms[i], 80);
+    }
+    if (alarms.size() > 2) {
+        out += L"\n[报警] +" + std::to_wstring(alarms.size() - 2);
+    }
+    return out;
+}
+
+static std::wstring BuildL1(const CachedFrame& f, const std::vector<std::wstring>& alarms) {
+    std::wstring out = L"[L1] " + FrameType(f) + L"「" + Truncate(FrameTitle(f), 40) + L"」";
+    int lines = 1;
+
+    for (const auto& b : f.sieve.blocks) {
+        if (b.items.empty()) continue;
+        std::wstring text = b.items[0].text;
+        out += L"\n[" + b.kind + L"] " + Truncate(text, 60) + L" @" + Zone(b.box);
+        if (++lines >= 8) break;
+    }
+    for (const auto& n : f.ui) {
+        if (!n.invokable || n.offscreen) continue;
+        out += L"\n[控件] " + n.role + L":" + Truncate(n.name, 40) + L" @" + Zone(n.rect);
+        if (++lines >= 10) break;
+    }
+    for (size_t i = 0; i < alarms.size() && i < 2; ++i) {
+        out += L"\n[报警] " + Truncate(alarms[i], 80);
+    }
+    return out;
+}
+
+static std::wstring DeltaJson(const CachedFrame* prev, const CachedFrame& cur) {
+    int added = 0;
+    int removed = 0;
+    if (prev) {
+        std::set<std::wstring> a;
+        std::set<std::wstring> b;
+        for (const auto& l : prev->ocr.lines) {
+            std::wstring t = ToUpper(Trim(l.text));
+            if (!t.empty()) a.insert(t);
+        }
+        for (const auto& l : cur.ocr.lines) {
+            std::wstring t = ToUpper(Trim(l.text));
+            if (!t.empty()) b.insert(t);
+        }
+        for (const auto& s : b) if (!a.count(s)) ++added;
+        for (const auto& s : a) if (!b.count(s)) ++removed;
+    }
+    wchar_t buf[160] = {};
+    swprintf_s(buf, L"{\"added\":%d,\"removed\":%d,\"changed\":%ls}",
+               added, removed, (added > 0 || removed > 0) ? L"true" : L"false");
+    return buf;
+}
+
 // ------------------------------ 请求处理 ------------------------------
 //
 // 在 worker 线程里跑。以后 framing / zoom / memory / skill 都挂在这里，
 // 因为它们的全部状态都在 worker 手上。
+
+static std::wstring ErrorResponse(const std::wstring& id, const std::wstring& op,
+                                  int rc, const std::wstring& error) {
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"id", id).Bool(L"ok", false).Str(L"op", op);
+    d.Int(L"rc", rc).Str(L"error", error);
+    return d.Emit();
+}
+
+static std::wstring FrameResponse(const std::wstring& id, const std::wstring& op,
+                                  const CachedFrame& f, const std::wstring& level,
+                                  const std::vector<std::wstring>& alarms,
+                                  const std::wstring& delta, DWORD ms) {
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"id", id).Bool(L"ok", true).Str(L"op", op);
+    d.Str(L"level", level).Str(L"ref", f.ref);
+    d.Bool(L"cached", op == L"zoom");
+
+    std::wstring text;
+    if (level == L"L2") {
+        text = L"[L2] ref=" + f.ref + L" raw=" + std::to_wstring(f.ocr.lines.size()) +
+               L" ui=" + std::to_wstring(f.ui.size());
+    } else if (level == L"L1") {
+        text = BuildL1(f, alarms);
+    } else {
+        text = BuildL0(f, alarms, delta);
+    }
+    d.Str(L"text", text);
+    d.Raw(L"delta", delta);
+    d.Raw(L"alarms", AlarmsJson(alarms));
+    d.Int(L"lines", (long long)f.ocr.lines.size());
+    d.Int(L"ui_nodes", (long long)f.ui.size());
+    d.Int(L"ms", (long long)ms);
+
+    if (level == L"L2") {
+        d.Raw(L"lines", LinesJson(f.ocr.lines));
+        d.Raw(L"ui", UiJson(f.ui));
+        d.Raw(L"windows", WindowsJson(f.sieve.windows));
+    }
+    return d.Emit();
+}
 
 static std::wstring HandleOp(const std::wstring& req) {
     std::wstring op = JsonField(req, L"op");
@@ -113,18 +441,77 @@ static std::wstring HandleOp(const std::wstring& req) {
         d.Int(L"pid", (long long)GetCurrentProcessId());
         d.Int(L"uptime_ms", (long long)(GetTickCount() - g_startTick));
         d.Int(L"clients", g_clients.load());
+        d.Int(L"frames", (long long)g_frames.size());
         d.Str(L"pipe", PipeName());
         d.Str(L"data_dir", DataDir());
         return d.Emit();
     }
 
-    JsonDoc d;
-    d.Str(L"v", L"1").Str(L"id", id).Bool(L"ok", false).Int(L"rc", 1);
-    d.Str(L"error", L"unknown-op: " + op);
-    return d.Emit();
+    if (op == L"framing") {
+        std::wstring key = JsonField(req, L"key");
+        if (key.empty()) key = L"default";
+        std::wstring target = JsonField(req, L"target");
+        if (!target.empty() && target != L"screen") {
+            return ErrorResponse(id, op, 1, L"unsupported target: " + target);
+        }
+        std::wstring level = ToUpper(JsonField(req, L"level"));
+        if (level.empty() || level == L"AUTO") level = L"L0";
+        if (level != L"L0" && level != L"L1" && level != L"L2") {
+            return ErrorResponse(id, op, 1, L"bad level: " + level);
+        }
+
+        DWORD t0 = GetTickCount();
+        CachedFrame f = CaptureFrame();
+        if (!f.ocr.ok) {
+            return ErrorResponse(id, op, 3, f.ocr.error.empty() ? L"capture failed" : f.ocr.error);
+        }
+
+        std::vector<std::wstring> alarms = CollectAlarms(f);
+
+        const CachedFrame* prev = nullptr;
+        auto last = g_lastRef.find(key);
+        if (last != g_lastRef.end()) {
+            auto it = g_frames.find(last->second);
+            if (it != g_frames.end()) prev = &it->second;
+        }
+        std::wstring delta = DeltaJson(prev, f);
+
+        if (g_frames.size() >= kMaxFrames) {
+            auto oldest = g_frames.begin();
+            for (auto it = g_frames.begin(); it != g_frames.end(); ++it) {
+                if (it->second.at < oldest->second.at) oldest = it;
+            }
+            g_frames.erase(oldest);
+        }
+        DWORD ms = GetTickCount() - t0;
+        g_frames[f.ref] = f;
+        g_lastRef[key] = f.ref;
+        return FrameResponse(id, op, f, level, alarms, delta, ms);
+    }
+
+    if (op == L"zoom") {
+        std::wstring ref = JsonField(req, L"ref");
+        auto it = g_frames.find(ref);
+        if (it == g_frames.end()) {
+            return ErrorResponse(id, op, 4, L"ref not found or expired: " + ref);
+        }
+        const CachedFrame& f = it->second;
+        std::vector<std::wstring> alarms = CollectAlarms(f);
+        std::wstring delta = L"{\"added\":0,\"removed\":0,\"changed\":false}";
+        return FrameResponse(id, op, f, L"L2", alarms, delta, 0);
+    }
+
+    return ErrorResponse(id, op, 1, L"unknown-op: " + op);
 }
 
 static void WorkerLoop() {
+    // OCR / UIA 都是 COM；worker 是唯一碰采集的线程，所以它自己进 MTA。
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+        // 已初始化过就忽略
+    }
+
     for (;;) {
         Job* j = nullptr;
         {
@@ -331,20 +718,90 @@ static int CmdStatus() {
     return 0;
 }
 
+static std::wstring GetOpt(int argc, wchar_t** argv, const wchar_t* name) {
+    for (int i = 2; i + 1 < argc; ++i) {
+        if (_wcsicmp(argv[i], name) == 0) return argv[i + 1];
+    }
+    return L"";
+}
+
+static int CmdFraming(int argc, wchar_t** argv) {
+    std::wstring key = GetOpt(argc, argv, L"--key");
+    std::wstring level = GetOpt(argc, argv, L"--level");
+    if (key.empty()) key = L"default";
+    if (level.empty()) level = L"auto";
+
+    std::wstring req = L"{\"v\":1,\"op\":\"framing\",\"id\":\"cli\",\"key\":\"" +
+                       JsonStr(key) + L"\",\"target\":\"screen\",\"level\":\"" +
+                       JsonStr(level) + L"\"}";
+    std::wstring resp;
+    if (CallServer(req, resp, 50)) {
+        wprintf(L"%ls\n", resp.c_str());
+        return 0;
+    }
+
+    // fail-open：服务不在，本地采集并投影，只是没有跨调用状态。
+    DWORD t0 = GetTickCount();
+    CachedFrame f = CaptureFrame();
+    if (!f.ocr.ok) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"id", L"cli").Bool(L"ok", false).Str(L"op", L"framing");
+        d.Int(L"rc", 3).Str(L"error", f.ocr.error.empty() ? L"capture failed" : f.ocr.error);
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 3;
+    }
+    std::wstring lv = ToUpper(level);
+    if (lv.empty() || lv == L"AUTO") lv = L"L0";
+    if (lv != L"L0" && lv != L"L1" && lv != L"L2") lv = L"L0";
+
+    auto alarms = CollectAlarms(f);
+    std::wstring delta = L"{\"added\":0,\"removed\":0,\"changed\":false}";
+    DWORD ms = GetTickCount() - t0;
+    wprintf(L"%ls\n", FrameResponse(L"cli", L"framing", f, lv, alarms, delta, ms).c_str());
+    return 0;
+}
+
+static int CmdZoom(int argc, wchar_t** argv) {
+    std::wstring ref = GetOpt(argc, argv, L"--ref");
+    if (ref.empty() && argc > 2 && argv[2][0] != L'-') ref = argv[2];
+    if (ref.empty()) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"id", L"cli").Bool(L"ok", false).Str(L"op", L"zoom");
+        d.Int(L"rc", 1).Str(L"error", L"missing --ref");
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+    std::wstring req = L"{\"v\":1,\"op\":\"zoom\",\"id\":\"cli\",\"ref\":\"" +
+                       JsonStr(ref) + L"\"}";
+    std::wstring resp;
+    if (!CallServer(req, resp, 50)) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"id", L"cli").Bool(L"ok", false).Str(L"op", L"zoom");
+        d.Int(L"rc", 6).Str(L"error", L"server not running");
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 6;
+    }
+    wprintf(L"%ls\n", resp.c_str());
+    return 0;
+}
+
 // ------------------------------ 入口 ------------------------------
 
 static void PrintUsage() {
     wprintf(L"YX —— 中枢（YX）v%ls\n", YX_VERSION);
     wprintf(L"给 AI 用的观测层：把电脑的真实翻译成 AI 能消化的视图。\n\n");
-    wprintf(L"  yx serve     常驻，监听 %ls\n", PipeName().c_str());
-    wprintf(L"  yx status    问常驻进程要状态（没开就在本地回一份）\n");
-    wprintf(L"  yx help      这份帮助\n\n");
+    wprintf(L"  yx serve                          常驻，监听 %ls\n", PipeName().c_str());
+    wprintf(L"  yx status                         问常驻进程要状态（没开就本地回一份）\n");
+    wprintf(L"  yx framing [--level L0|L1|L2]     取一帧；默认 L0\n");
+    wprintf(L"  yx zoom --ref <ref>               按 ref 回 L2，不重新截屏\n");
+    wprintf(L"  yx help                           这份帮助\n\n");
     wprintf(L"管道协议：u32 长度前缀 + UTF-8 JSON\n");
-    wprintf(L"退出码：0 成功 / 1 参数错误 / 6 服务已在运行\n");
+    wprintf(L"退出码：0 成功 / 1 参数错误 / 3 采集失败 / 4 ref 过期 / 6 服务未就绪\n");
 }
 
 int wmain(int argc, wchar_t** argv) {
     InitConsoleUtf8();
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     // 两个程序共用一个日志模块，账本要分开：配置目录、日志目录、锁名、文件名
     // 全部跟着程序名走。不这么做，客户端一跑就会往 handeye 的目录里写东西。
     LogSetApp(L"yx");
@@ -361,6 +818,10 @@ int wmain(int argc, wchar_t** argv) {
         rc = Serve();
     } else if (cmd == L"status") {
         rc = CmdStatus();
+    } else if (cmd == L"framing") {
+        rc = CmdFraming(argc, argv);
+    } else if (cmd == L"zoom") {
+        rc = CmdZoom(argc, argv);
     } else {
         Say(L"未知命令: %ls", cmd.c_str());
         PrintUsage();

@@ -25,8 +25,11 @@ if not exist build\handeye mkdir build\handeye
 if not exist build\yx mkdir build\yx
 
 echo Building handeye.exe ...
-rem /MP: compile the translation units in parallel (cuts a full build from ~35s to ~10s)
-cl /nologo /utf-8 /std:c++20 /EHsc /O2 /MT /MP /Fo:build\handeye\ /Fe:handeye.exe src\*.cpp windowsapp.lib gdi32.lib user32.lib ole32.lib
+rem Organs only: collect + execute. No sieve, no ledger, no verification.
+cl /nologo /utf-8 /std:c++20 /EHsc /O2 /MT /MP /Fo:build\handeye\ /Fe:handeye.exe ^
+    src\common.cpp src\log.cpp src\eye.cpp src\uia.cpp src\winenum.cpp src\clip.cpp ^
+    src\input.cpp src\mouth.cpp src\schema.cpp src\doctor.cpp src\main.cpp ^
+    windowsapp.lib gdi32.lib user32.lib ole32.lib advapi32.lib
 
 if errorlevel 1 (
     echo [FAILED]
@@ -34,8 +37,11 @@ if errorlevel 1 (
 )
 
 echo Building yx.exe ...
-rem Only the core the server needs today; eye/sieve join in the next step.
-cl /nologo /utf-8 /std:c++20 /EHsc /O2 /MT /MP /Fo:build\yx\ /Fe:yx.exe src\common.cpp src\log.cpp src\yx\main.cpp user32.lib advapi32.lib
+rem v0.1: one capture, L0/L1/L2 projections, zoom.
+cl /nologo /utf-8 /std:c++20 /EHsc /O2 /MT /MP /Fo:build\yx\ /Fe:yx.exe ^
+    src\common.cpp src\log.cpp src\sieve.cpp src\eye.cpp src\uia.cpp src\winenum.cpp ^
+    src\yx\main.cpp ^
+    windowsapp.lib gdi32.lib user32.lib ole32.lib oleaut32.lib advapi32.lib
 
 if errorlevel 1 (
     echo [FAILED]

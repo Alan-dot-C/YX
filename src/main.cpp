@@ -13,15 +13,11 @@
 // ============================================================================
 #include "common.h"
 #include "eye.h"
-#include "sieve.h"
+#include "winenum.h"
 #include "input.h"
 #include "mouth.h"
 #include "log.h"
-#include "logquery.h"
-#include "bench.h"
-#include "guard.h"
 #include "doctor.h"
-#include "gui.h"
 #include "schema.h"
 #include "uia.h"
 #include "clip.h"
@@ -84,27 +80,18 @@ static bool ParseRect(const std::wstring& s, RectI& out) {
     return out.w > 0 && out.h > 0;
 }
 
-static std::vector<LineItem> BuildContentParagraphs(const SieveResult& sr, int maxChars);
-static int Dispatch(const ArgList& args, const std::wstring& cmd);
-static std::wstring SaveFailureShot();
-
-// ------------------------------ 状态文件 ------------------------------
-//
-// 状态文件按 key 隔离：两个会话同时使用时不会再互相把 delta 基准写坏。
-// --region 用它自己的 key，避免把整屏的基准覆盖成一小块。
-
-static std::wstring ResolveStateKey(const ArgList& args, const RectI& region) {
-    std::wstring key = args.Get(L"--state-key");
-    if (!key.empty()) return key;
-    if (!region.empty()) {
-        wchar_t buf[96] = {};
-        swprintf_s(buf, L"region_%d_%d_%d_%d", region.x, region.y, region.w, region.h);
-        return buf;
+static std::wstring RedactArgv(const std::vector<std::wstring>& raw) {
+    std::wstring s;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (i) s += L' ';
+        s += raw[i];
     }
-    return L"default";
+    return LogRedactText(s);
 }
 
-// ------------------------------ see ------------------------------
+static int Dispatch(const ArgList& args, const std::wstring& cmd);
+
+// ------------------------------ raw collection ------------------------------
 
 // 把命令行开关翻译成一次识别请求。
 // 默认 auto：中文走 1x，拉丁/数字行再跑一路英文；--fast 只跑中文 1x。
@@ -128,902 +115,180 @@ static OcrRequest BuildOcrRequest(const ArgList& args, const RectI& region) {
     return req;
 }
 
-static int CmdSee(const ArgList& args) {
-    RectI region{};
-    std::wstring regionStr = args.Get(L"--region");
-    if (!regionStr.empty() && !ParseRect(regionStr, region)) {
-        wprintf(L"ERR --region 需要 \"x,y,w,h\" 格式\n");
-        return 1;
-    }
-    const std::wstring stateKey = ResolveStateKey(args, region);
-
-    // --changed 走图像指纹，不需要 OCR，又快又稳。
-    // 早先用 OCR 文本比对，OCR 逐帧有小抖动，会误报 +4/-4。
-    if (args.Has(L"--changed")) {
-        // Coarse grid difference. A single hash bit tells you that something
-        // moved; the grid tells you where. 48x30 cells over the whole screen
-        // is 1440 bytes of state and localises the change well enough to act.
-        const int GW = 48, GH = 30;
-        std::vector<uint8_t> now;
-        if (!EyeCoarseGrid(GW, GH, now, region)) {
-            wprintf(L"ERR 截屏失败\n");
-            return 3;
-        }
-
-        std::wstring gridPath = StateFilePath(L"last_grid", stateKey);
-
-        std::vector<uint8_t> prev;
-        bool havePrev = false;
-        {
-            FILE* f = nullptr;
-            if (_wfopen_s(&f, gridPath.c_str(), L"rb") == 0 && f) {
-                std::string hex;
-                char buf[4096];
-                size_t got = fread(buf, 1, sizeof(buf) - 1, f);
-                hex.assign(buf, got);
-                fclose(f);
-                if (hex.size() == size_t(GW) * GH * 2) {
-                    prev.resize(size_t(GW) * GH);
-                    for (size_t i = 0; i < prev.size(); ++i) {
-                        char b2[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
-                        prev[i] = (uint8_t)strtoul(b2, nullptr, 16);
-                    }
-                    havePrev = true;
-                }
-            }
-        }
-
-        RECT scrRect{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
-        if (!region.empty()) scrRect = RECT{ region.x, region.y, region.right(), region.bottom() };
-        int sw = scrRect.right - scrRect.left, sh = scrRect.bottom - scrRect.top;
-        int cw = (sw + GW - 1) / GW, ch = (sh + GH - 1) / GH;
-
-        const int cellThreshold = args.GetInt(L"--threshold", 12);
-        int changedCells = 0;
-        int minX = GW, minY = GH, maxX = -1, maxY = -1;
-        for (int y = 0; y < GH; ++y) {
-            for (int x = 0; x < GW; ++x) {
-                size_t i = size_t(y) * GW + x;
-                int diff = havePrev ? std::abs(int(now[i]) - int(prev[i])) : 255;
-                if (diff > cellThreshold) {
-                    ++changedCells;
-                    if (x < minX) minX = x;
-                    if (y < minY) minY = y;
-                    if (x > maxX) maxX = x;
-                    if (y > maxY) maxY = y;
-                }
-            }
-        }
-        bool changed = !havePrev || changedCells > 0;
-        LogV(L"感知", 3009, L"感知", L"屏幕指纹",
-             L"changed=%d cells=%d firstFrame=%d", changed ? 1 : 0, changedCells, havePrev ? 0 : 1);
-
-        // Save the new grid for next time.
-        {
-            FILE* f = nullptr;
-            if (_wfopen_s(&f, gridPath.c_str(), L"wb") == 0 && f) {
-                std::string hex;
-                hex.reserve(now.size() * 2);
-                const char* digits = "0123456789abcdef";
-                for (uint8_t v : now) { hex += digits[v >> 4]; hex += digits[v & 0xF]; }
-                fwrite(hex.data(), 1, hex.size(), f);
-                fclose(f);
-            }
-        }
-
-        if (g_opt.json) {
-            JsonDoc d;
-            d.Bool(L"ok", true).Bool(L"changed", changed).Int(L"cells", changedCells);
-            if (changed) {
-                wchar_t regionJson[128] = {};
-                swprintf_s(regionJson, L"{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}",
-                           scrRect.left + minX * cw, scrRect.top + minY * ch,
-                           (maxX - minX + 1) * cw, (maxY - minY + 1) * ch);
-                d.Raw(L"region", regionJson);
-            }
-            d.Bool(L"firstFrame", !havePrev);
-            wprintf(L"%ls\n", d.Emit().c_str());
-        } else {
-            if (changed) {
-                // Cell size rounds up, so the box can overshoot the captured
-                // region. Clamp it, otherwise the reported area is larger than
-                // the area that was actually looked at.
-                int bx = scrRect.left + minX * cw;
-                int by = scrRect.top + minY * ch;
-                int bw = (maxX - minX + 1) * cw;
-                int bh = (maxY - minY + 1) * ch;
-                if (bx + bw > scrRect.right) bw = scrRect.right - bx;
-                if (by + bh > scrRect.bottom) bh = scrRect.bottom - by;
-                wprintf(L"CHANGED\tx=%d y=%d w=%d h=%d cells=%d\n", bx, by, bw, bh, changedCells);
-            } else {
-                wprintf(L"UNCHANGED\n");
-            }
-        }
-        return 0;
-    }
-
-    if (!EyeInit()) {
-        if (g_opt.json) {
-            JsonDoc d;
-            d.Bool(L"ok", false).Str(L"error", L"no OCR engine");
-            wprintf(L"%ls\n", d.Emit().c_str());
-        } else {
-            wprintf(L"ERR 没有可用的 OCR 引擎（可能没装中文 OCR 语言包）\n");
-        }
-        LogE(L"感知", 3006, L"异常", L"OCR 引擎不可用", L"reason=no-engine");
-        return 3;
-    }
-
-    OcrRequest oreq = BuildOcrRequest(args, region);
-
-    // --wait：轮询直到文字出现
-    std::wstring waitText = args.Get(L"--wait");
-    int timeoutMs = args.GetInt(L"--timeout", 5000);
-
-    if (!waitText.empty()) {
-        DWORD start = GetTickCount();
-        for (;;) {
-            OcrResult r = EyeRecognize(oreq);
-            if (!r.ok) {
-                wprintf(L"ERR %ls\n", r.error.c_str());
-                return 3;
-            }
-            auto hits = SieveFind(r.lines, waitText, 1);
-            if (!hits.empty()) {
-                const auto& h = hits[0];
-                if (g_opt.json) {
-                    JsonDoc d;
-                    d.Bool(L"ok", true).Bool(L"found", true);
-                    d.Str(L"text", h.text);
-                    d.Int(L"x", h.box.x).Int(L"y", h.box.y).Int(L"w", h.box.w).Int(L"h", h.box.h);
-                    d.Dbl(L"score", h.score);
-                    d.Raw(L"elapsedMs", std::to_wstring(GetTickCount() - start));
-                    wprintf(L"%ls\n", d.Emit().c_str());
-                } else {
-                    wprintf(L"FOUND\t%ls\t%d\t%d\t%d\t%d\t%.2f\t%lums\n",
-                            h.text.c_str(), h.box.x, h.box.y, h.box.w, h.box.h, h.score,
-                            (unsigned long)(GetTickCount() - start));
-                }
-                LogI(L"感知", 3011, L"感知", L"等待文字出现", L"%ls ms=%lu", LogRedactText(waitText).c_str(), (unsigned long)(GetTickCount() - start));
-                return 0;
-            }
-            if ((int)(GetTickCount() - start) > timeoutMs) {
-                if (g_opt.json)
-                    wprintf(L"{\"ok\":false,\"found\":false,\"error\":\"timeout\",\"elapsedMs\":%lu}\n",
-                            (unsigned long)(GetTickCount() - start));
-                else
-                    wprintf(L"NOTFOUND\t超时 %dms\n", timeoutMs);
-                LogW(L"感知", 3010, L"感知", L"等待文字超时", L"%ls timeout=%d", LogRedactText(waitText).c_str(), timeoutMs);
-                return 1;
-            }
-            if (ShouldAbort()) {
-                LogW(L"动作", 4015, L"停止", L"动作被中止", L"stage=wait %ls",
-                     LogRedactText(waitText).c_str());
-                if (g_opt.json) {
-                    JsonDoc d;
-                    d.Bool(L"ok", false).Str(L"error", L"aborted");
-                    wprintf(L"%ls\n", d.Emit().c_str());
-                } else {
-                    wprintf(L"ABORTED\n");
-                }
-                return 4;
-            }
-            Sleep(200);
-        }
-    }
-
-    // 保存截图（可选）
-    std::wstring savePath = args.Get(L"--save");
-    if (!savePath.empty()) {
-        if (!EyeSavePng(savePath, region)) {
-            wprintf(L"WARN 截图保存失败: %ls\n", savePath.c_str());
-        }
-    }
-
-    DWORD tCapture = GetTickCount();
-    OcrResult r = EyeRecognize(oreq);
-    DWORD msCapture = GetTickCount() - tCapture;
-    if (!r.ok) {
-        LogE(L"感知", r.timedOut ? 3007 : 3008, L"异常",
-             r.timedOut ? L"OCR 超时" : L"截屏失败",
-             L"err=%ls ms=%lu", r.error.c_str(), (unsigned long)msCapture);
-        std::wstring shot = SaveFailureShot();
-        if (!shot.empty()) Say(L"现场截图: %ls", shot.c_str());
-        if (g_opt.json) {
-            JsonDoc d;
-            d.Bool(L"ok", false).Str(L"error", r.error);
-            wprintf(L"%ls\n", d.Emit().c_str());
-        } else {
-            wprintf(L"ERR %ls\n", r.error.c_str());
-        }
-        return 3;
-    }
-    LogV(L"感知", 3000, L"感知", L"截屏开始", L"x=%d y=%d w=%d h=%d scale=%d", region.x, region.y, region.w, region.h, r.scale);
-    LogV(L"感知", 3002, L"感知", L"OCR 完成", L"raw=%zu ms=%lu", r.lines.size(), (unsigned long)msCapture);
-    {
-        // 分路统计：出问题时第一眼要能看出英文通道有没有跑、跑出多少行
-        int zhLines = 0, enLines = 0;
-        for (const auto& l : r.lines) {
-            if (l.src.rfind(L"en", 0) == 0) ++enLines;
-            else ++zhLines;
-        }
-        LogI(L"感知", 3012, L"感知", L"OCR 分路统计",
-             L"zh=%d en=%d raw=%zu ms=%lu", zhLines, enLines, r.lines.size(), (unsigned long)msCapture);
-    }
-
-    // --raw：不做筛子，直接吐原始行
-    if (args.Has(L"--raw")) {
-        if (g_opt.json) {
-            std::wstring linesJson = L"[";
-            for (size_t i = 0; i < r.lines.size(); ++i) {
-                if (i) linesJson += L",";
-                linesJson += L"{\"text\":\"" + JsonStr(r.lines[i].text) + L"\"";
-                linesJson += L",\"x\":" + std::to_wstring(r.lines[i].box.x);
-                linesJson += L",\"y\":" + std::to_wstring(r.lines[i].box.y);
-                linesJson += L",\"w\":" + std::to_wstring(r.lines[i].box.w);
-                linesJson += L",\"h\":" + std::to_wstring(r.lines[i].box.h) + L"}";
-            }
-            linesJson += L"]";
-            JsonDoc d;
-            d.Bool(L"ok", true).Bool(L"raw", true).Int(L"count", (long long)r.lines.size());
-            d.Raw(L"lines", linesJson);
-            wprintf(L"%ls\n", d.Emit().c_str());
-        } else {
-            wprintf(L"INFO raw=%zu scale=%d\n", r.lines.size(), r.scale);
-            for (const auto& l : r.lines) {
-                wprintf(L"%ls\t%d\t%d\t%d\t%d\n", l.text.c_str(), l.box.x, l.box.y, l.box.w, l.box.h);
-            }
-        }
-        return 0;
-    }
-
-    // --find：只看匹配
-    std::wstring findText = args.Get(L"--find");
-    if (!findText.empty()) {
-        auto hits = SieveFind(r.lines, findText, 8);
-        if (g_opt.json) {
-            std::wstring hitsJson = L"[";
-            for (size_t i = 0; i < hits.size(); ++i) {
-                if (i) hitsJson += L",";
-                wchar_t score[32] = {};
-                swprintf_s(score, L"%.2f", hits[i].score);
-                hitsJson += L"{\"text\":\"" + JsonStr(hits[i].text) + L"\"";
-                hitsJson += L",\"x\":" + std::to_wstring(hits[i].box.x);
-                hitsJson += L",\"y\":" + std::to_wstring(hits[i].box.y);
-                hitsJson += L",\"w\":" + std::to_wstring(hits[i].box.w);
-                hitsJson += L",\"h\":" + std::to_wstring(hits[i].box.h);
-                hitsJson += L",\"score\":" + std::wstring(score) + L"}";
-            }
-            hitsJson += L"]";
-            JsonDoc d;
-            d.Bool(L"ok", true).Int(L"count", (long long)hits.size());
-            d.Raw(L"hits", hitsJson);
-            wprintf(L"%ls\n", d.Emit().c_str());
-        } else {
-            if (hits.empty()) {
-                wprintf(L"NOTFOUND\t%ls\n", findText.c_str());
-                LogV(L"感知", 3005, L"感知", L"查找未命中", L"%ls", LogRedactText(findText).c_str());
-                return 1;
-            }
-            LogI(L"感知", 3004, L"感知", L"查找命中", L"%ls hits=%zu best=%.2f", LogRedactText(findText).c_str(), hits.size(), hits[0].score);
-            for (const auto& h : hits) {
-                wprintf(L"HIT\t%ls\t%d\t%d\t%d\t%d\t%.2f\n",
-                        h.text.c_str(), h.box.x, h.box.y, h.box.w, h.box.h, h.score);
-            }
-        }
-        return hits.empty() ? 1 : 0;
-    }
-
-    // 正常：走筛子
-    SieveOptions so;
-    so.keepAll = args.Has(L"--all");
-    so.maxLines = args.GetInt(L"--max-lines", 40);
-    so.maxLineChars = args.GetInt(L"--max-chars", 120);
-    so.doDelta = !args.Has(L"--no-delta");
-    so.stateKey = stateKey;
-
-    SieveResult sr = SieveRun(r.lines, so);
-    LogV(L"感知", 3003, L"感知", L"筛子完成", L"blocks=%zu raw=%zu", sr.blocks.size(), r.lines.size());
-
-    // --ui：把标准控件的树也带上。OCR 认的是像素，控件树认的是名字，
-    // 两者叠起来，模型既看得到自绘界面，也看得到真正的按钮名。
-    std::vector<UiNode> uiNodes;
-    if (args.Has(L"--ui") && UiInit()) {
-        DWORD t0 = GetTickCount();
-        uiNodes = UiTree(nullptr,
-                         args.GetInt(L"--ui-depth", 8),
-                         args.GetInt(L"--ui-max", 300),
-                         args.GetInt(L"--ui-timeout", 400));
-        LogI(L"感知", 3013, L"感知", L"UI 控件树",
-             L"nodes=%zu ms=%lu", uiNodes.size(), (unsigned long)(GetTickCount() - t0));
-    }
-
-    POINT cur = GetCursorPosNow();
-    std::wstring focus = GetForegroundTitle();
-    RectI scr = EyeScreenRect();
-
-    if (g_opt.json) {
-        JsonDoc d;
-        d.Bool(L"ok", true);
-        {
-            wchar_t buf[64] = {};
-            swprintf_s(buf, L"{\"w\":%d,\"h\":%d}", scr.w, scr.h);
-            d.Raw(L"screen", buf);
-        }
-        {
-            wchar_t buf[64] = {};
-            swprintf_s(buf, L"{\"x\":%d,\"y\":%d}", cur.x, cur.y);
-            d.Raw(L"cursor", buf);
-        }
-        d.Str(L"focus", focus);
-        d.Int(L"rawLines", (long long)r.lines.size());
-        {
-            wchar_t buf[128] = {};
-            swprintf_s(buf, L"{\"changed\":%ls,\"added\":%d,\"removed\":%d}",
-                       sr.changed ? L"true" : L"false", sr.newLines, sr.goneLines);
-            d.Raw(L"delta", buf);
-        }
-
-        std::wstring blocks = L"[";
-        bool firstBlock = true;
-        for (const auto& b : sr.blocks) {
-            if (!firstBlock) blocks += L",";
-            firstBlock = false;
-            blocks += L"{\"kind\":\"" + JsonStr(b.kind) + L"\"";
-            blocks += L",\"window\":\"" + JsonStr(b.window) + L"\"";
-            blocks += L",\"box\":{\"x\":" + std::to_wstring(b.box.x) + L",\"y\":" + std::to_wstring(b.box.y);
-            blocks += L",\"w\":" + std::to_wstring(b.box.w) + L",\"h\":" + std::to_wstring(b.box.h) + L"}";
-            blocks += L",\"items\":[";
-            for (size_t i = 0; i < b.items.size(); ++i) {
-                if (i) blocks += L",";
-                blocks += L"{\"text\":\"" + JsonStr(b.items[i].text) + L"\"";
-                blocks += L",\"x\":" + std::to_wstring(b.items[i].box.x);
-                blocks += L",\"y\":" + std::to_wstring(b.items[i].box.y);
-                blocks += L",\"w\":" + std::to_wstring(b.items[i].box.w);
-                blocks += L",\"h\":" + std::to_wstring(b.items[i].box.h) + L"}";
-            }
-            blocks += L"]}";
-        }
-        blocks += L"]";
-        d.Raw(L"blocks", blocks);
-
-        if (!uiNodes.empty()) {
-            std::wstring ui = L"[";
-            for (size_t i = 0; i < uiNodes.size(); ++i) {
-                if (i) ui += L",";
-                ui += L"{\"role\":\"" + JsonStr(uiNodes[i].role) + L"\"";
-                ui += L",\"name\":\"" + JsonStr(uiNodes[i].name) + L"\"";
-                ui += L",\"value\":\"" + JsonStr(uiNodes[i].value) + L"\"";
-                ui += L",\"x\":" + std::to_wstring(uiNodes[i].rect.x);
-                ui += L",\"y\":" + std::to_wstring(uiNodes[i].rect.y);
-                ui += L",\"w\":" + std::to_wstring(uiNodes[i].rect.w);
-                ui += L",\"h\":" + std::to_wstring(uiNodes[i].rect.h);
-                ui += std::wstring(L",\"invokable\":") + (uiNodes[i].invokable ? L"true" : L"false");
-                ui += L"}";
-            }
-            ui += L"]";
-            d.Raw(L"ui", ui);
-        }
-
-        wprintf(L"%ls\n", d.Emit().c_str());
-        return 0;
-    }
-
-    // 文本输出：紧凑、可解析
-    // 策略：正文按阅读顺序拼成段落（正文不需要逐行坐标），
-    //       只有可能被点击的元素（标题/按钮/对话框/侧栏/工具栏）才逐行给坐标。
-    std::vector<LineItem> contentParas = BuildContentParagraphs(sr, 140);
-    int maxParas = args.GetInt(L"--max-paras", 10);
-    if (!args.Has(L"--all") && (int)contentParas.size() > maxParas)
-        contentParas.resize(maxParas);
-
-    wprintf(L"INFO screen=%dx%d cursor=%d,%d scale=%d raw=%zu blocks=%zu paras=%zu delta=+%d/-%d\n",
-            scr.w, scr.h, cur.x, cur.y, r.scale, r.lines.size(), sr.blocks.size(),
-            contentParas.size(), sr.newLines, sr.goneLines);
-    if (!focus.empty()) wprintf(L"[focus] %ls\n", focus.c_str());
-
-    for (const auto& n : uiNodes) {
-        wprintf(L"[ui:%ls] %ls @%d,%d %dx%d%ls%ls\n",
-                n.role.c_str(), n.name.c_str(), n.rect.x, n.rect.y, n.rect.w, n.rect.h,
-                n.invokable ? L" invoke" : L"",
-                n.value.empty() ? L"" : (L" value=" + n.value).c_str());
-    }
-
-    // Output grouped by owning window. A window header is printed once, then
-    // its elements, then its body paragraphs. This is the structure the OS
-    // actually has, rather than something inferred from pixel distances.
-    {
-        // distinct windows in Z order
-        std::vector<int> zs;
-        for (const auto& b : sr.blocks) {
-            if (std::find(zs.begin(), zs.end(), b.winZ) == zs.end()) zs.push_back(b.winZ);
-        }
-        std::sort(zs.begin(), zs.end(), [](int a, int b) {
-            return (a < 0 ? 100000 : a) < (b < 0 ? 100000 : b);
-        });
-
-        int paraCount = 0;
-        for (int z : zs) {
-            std::wstring title;
-            for (const auto& b : sr.blocks) {
-                if (b.winZ == z && !b.window.empty()) { title = b.window; break; }
-            }
-            // Skip windows that have no recognised text, otherwise the output
-            // is full of empty headers for windows hidden behind others.
-            bool hasAny = false;
-            for (const auto& b : sr.blocks) if (b.winZ == z && !b.items.empty()) { hasAny = true; break; }
-            if (!hasAny) continue;
-
-            if (title.empty()) wprintf(L"[win] (桌面或不属于任何窗口)\n");
-            else wprintf(L"[win] %ls\n", title.c_str());
-
-            for (const auto& b : sr.blocks) {
-                if (b.winZ != z || b.kind == L"content") continue;
-                for (const auto& it : b.items) {
-                    wprintf(L"[%ls] %ls @%d,%d %dx%d\n",
-                            b.kind.c_str(), it.text.c_str(),
-                            it.box.x, it.box.y, it.box.w, it.box.h);
-                }
-            }
-
-            SieveResult sub;
-            for (const auto& b : sr.blocks)
-                if (b.winZ == z && b.kind == L"content") sub.blocks.push_back(b);
-            std::vector<LineItem> paras = BuildContentParagraphs(sub, 140);
-            for (const auto& p : paras) {
-                if (maxParas > 0 && paraCount >= maxParas) break;
-                wprintf(L"[content] %ls @%d,%d %dx%d\n",
-                        p.text.c_str(), p.box.x, p.box.y, p.box.w, p.box.h);
-                ++paraCount;
-            }
-        }
-    }
-    if (!sr.windows.empty()) {
-        wprintf(L"[windows] %zu 个:\n", sr.windows.size());
-        for (const auto& w : sr.windows) {
-            wprintf(L"  z=%d %ls @%d,%d %dx%d\n",
-                    w.z, w.title.c_str(), w.rect.x, w.rect.y, w.rect.w, w.rect.h);
-        }
-    }
-
-    if (args.Has(L"--show-delta") && sr.changed) {
-        for (const auto& a : sr.added) wprintf(L"  + %ls\n", a.c_str());
-        for (const auto& d : sr.removed) wprintf(L"  - %ls\n", d.c_str());
-    }
-    return 0;
+static std::wstring RectJson(const RectI& r) {
+    wchar_t buf[128] = {};
+    swprintf_s(buf, L"{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}", r.x, r.y, r.w, r.h);
+    return buf;
 }
 
-// 把散落的正文行按阅读顺序拼成段落，大幅压掉输出体积。
-// 关键：先按 x 分栏，再在栏内按 y 排序拼段。
-// 只按 y 排序会把侧栏和正文交错混在一起。
-static std::vector<LineItem> BuildContentParagraphs(const SieveResult& sr, int maxChars) {
-    std::vector<LineItem> items;
-    for (const auto& b : sr.blocks)
-        if (b.kind == L"content")
-            for (const auto& it : b.items) items.push_back(it);
-
-    if (items.empty()) return {};
-
-    // 1) 按左边界分栏
-    std::vector<LineItem> byX = items;
-    std::sort(byX.begin(), byX.end(), [](const LineItem& a, const LineItem& b) {
-        return a.box.x < b.box.x;
-    });
-    std::vector<std::vector<LineItem>> columns;
-    int colStart = byX[0].box.x;
-    columns.push_back({});
-    for (const auto& it : byX) {
-        if (it.box.x - colStart > 140) {
-            columns.push_back({});
-            colStart = it.box.x;
-        }
-        columns.back().push_back(it);
+static std::wstring LinesJson(const std::vector<OcrLine>& lines) {
+    std::wstring s = L"[";
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (i) s += L",";
+        const OcrLine& l = lines[i];
+        s += L"{\"text\":\"" + JsonStr(l.text) + L"\"";
+        s += L",\"x\":" + std::to_wstring(l.box.x);
+        s += L",\"y\":" + std::to_wstring(l.box.y);
+        s += L",\"w\":" + std::to_wstring(l.box.w);
+        s += L",\"h\":" + std::to_wstring(l.box.h);
+        s += L",\"words\":" + std::to_wstring(l.words);
+        wchar_t q[32] = {};
+        swprintf_s(q, L"%.3f", l.quality);
+        s += L",\"q\":" + std::wstring(q);
+        s += L",\"src\":\"" + JsonStr(l.src) + L"\"}";
     }
-
-    // 2) 每栏内部按 y 排序后拼段
-    std::vector<LineItem> out;
-    for (auto& col : columns) {
-        std::sort(col.begin(), col.end(), [](const LineItem& a, const LineItem& b) {
-            return a.box.y < b.box.y;
-        });
-        LineItem cur{};
-        bool has = false;
-        int lastBottom = 0;
-        for (const auto& it : col) {
-            bool newChunk = !has;
-            if (has) {
-                if (it.box.y - lastBottom > 42) newChunk = true;
-                if ((int)(cur.text.size() + it.text.size()) > maxChars) newChunk = true;
-            }
-            if (newChunk) {
-                if (has) out.push_back(cur);
-                cur = it;
-                has = true;
-            } else {
-                cur.text += L" ";
-                cur.text += it.text;
-                int right = (std::max)(cur.box.right(), it.box.right());
-                int bottom = (std::max)(cur.box.bottom(), it.box.bottom());
-                cur.box.w = right - cur.box.x;
-                cur.box.h = bottom - cur.box.y;
-            }
-            lastBottom = (std::max)(lastBottom, it.box.bottom());
-        }
-        if (has) out.push_back(cur);
-    }
-    return out;
-}
-
-// ------------------------------ click-text：眼手联动 ------------------------------
-
-// 一次命中的统一表示：不管来自 UI Automation 还是 OCR
-struct ClickHit {
-    std::wstring text;
-    RectI        box;
-    double       score = 0;
-    std::wstring via = L"ocr";
-    bool         invokable = false;
-    bool         haveUi = false;
-    UiNode       ui;
-};
-
-// 找到屏幕上的文字并点它。这是"眼"和"手"的接缝：
-// AI 不需要知道坐标，只要说要点什么。
-//
-// 策略链：先 UI Automation（标准控件有名字和边界，不会认错字），
-// 命中不了再回落到 OCR。--via ocr 可以强制走 OCR。
-static int CmdClickText(const ArgList& args) {
-    auto pos = args.Positional();
-    if (pos.size() < 2) { wprintf(L"ERR 用法: click-text <文字> [--index N] [--timeout ms]\n"); return 1; }
-    std::wstring needle;
-    for (size_t i = 1; i < pos.size(); ++i) {
-        if (!needle.empty()) needle += L" ";
-        needle += pos[i];
-    }
-    if (!EyeInit()) { wprintf(L"ERR 没有可用的 OCR 引擎\n"); return 3; }
-
-    const std::wstring via = ToUpper(args.Get(L"--via", L"auto"));
-    OcrRequest oreq = BuildOcrRequest(args, RectI{});
-    int timeout = args.GetInt(L"--timeout", 0);
-    int wanted = args.GetInt(L"--index", 0);
-    DWORD start = GetTickCount();
-
-    auto perform = [&](const ClickHit& h) -> int {
-        // Danger guard. A tool that can click anything needs a brake.
-        std::wstring dangerWord;
-        bool dangerous = GuardIsDangerous(h.text, dangerWord);
-        bool confirmed = args.Has(L"--yes");
-        if (dangerous && !confirmed) {
-            if (g_opt.dryRun) {
-                wprintf(L"[dry-run] 注意：目标含危险词「%ls」，正式执行会被拦截，需要加 --yes\n",
-                        dangerWord.c_str());
-            } else {
-                wprintf(L"BLOCKED\t目标含危险词「%ls」\n", dangerWord.c_str());
-                wprintf(L"         目标文字：%ls\n", h.text.c_str());
-                wprintf(L"         确认要执行请加 --yes\n");
-                LogW(L"动作", 4013, L"异常", L"危险动作被拦截",
-                     L"text=%ls word=%ls x=%d y=%d via=%ls",
-                     h.text.c_str(), dangerWord.c_str(), h.box.cx(), h.box.cy(), h.via.c_str());
-                return 1;
-            }
-        }
-
-        // 先记命中，dry-run 也留痕：出问题时"当时选中了什么"必须查得到
-        LogI(L"动作", 4014, L"动作", L"按文字点击命中",
-             L"%ls via=%ls x=%d y=%d score=%.2f dryRun=%d",
-             LogRedactText(h.text).c_str(), h.via.c_str(), h.box.cx(), h.box.cy(), h.score,
-             g_opt.dryRun ? 1 : 0);
-
-        if (g_opt.dryRun) {
-            std::wstring expectText = args.Get(L"--expect");
-            std::wstring expectGone = args.Get(L"--expect-gone");
-            if (!expectText.empty() || !expectGone.empty()) {
-                wprintf(L"[dry-run] 会验证：出现「%ls」 消失「%ls」\n",
-                        expectText.c_str(), expectGone.c_str());
-            }
-            if (g_opt.json) {
-                JsonDoc d;
-                d.Bool(L"ok", true).Bool(L"dryRun", true);
-                d.Str(L"text", h.text);
-                d.Int(L"x", h.box.cx()).Int(L"y", h.box.cy());
-                d.Dbl(L"score", h.score);
-                d.Bool(L"dangerous", dangerous);
-                d.Str(L"via", h.via);
-                wprintf(L"%ls\n", d.Emit().c_str());
-            } else {
-                wprintf(L"[dry-run] 会点击「%ls」@%d,%d (匹配度 %.2f, %ls)\n",
-                        h.text.c_str(), h.box.cx(), h.box.cy(), h.score, h.via.c_str());
-            }
-            return 0;
-        }
-
-        GuardAnnounce(std::wstring(L"点击 ") + h.text);
-
-        if (h.invokable && h.haveUi) {
-            // 标准按钮优先用 InvokePattern：不用移动鼠标，也不受坐标影响
-            if (!UiInvoke(h.ui)) {
-                InputInit();
-                ClickAt(h.box.cx(), h.box.cy(), args.Has(L"--right"));
-                InputShutdown();
-            }
-        } else {
-            InputInit();
-            ClickAt(h.box.cx(), h.box.cy(), args.Has(L"--right"));
-            InputShutdown();
-        }
-
-        if (g_opt.json) {
-            JsonDoc d;
-            d.Bool(L"ok", true);
-            d.Str(L"text", h.text);
-            d.Int(L"x", h.box.cx()).Int(L"y", h.box.cy());
-            d.Int(L"w", h.box.w).Int(L"h", h.box.h);
-            d.Dbl(L"score", h.score);
-            d.Str(L"via", h.via);
-            wprintf(L"%ls\n", d.Emit().c_str());
-        } else {
-            wprintf(L"CLICKED\t%ls\t%d\t%d\t%.2f\t%ls\n",
-                    h.text.c_str(), h.box.cx(), h.box.cy(), h.score, h.via.c_str());
-        }
-
-        // Optional post-action verification. This is what turns an open
-        // loop into a closed one: the caller learns whether it worked.
-        std::wstring expectText2 = args.Get(L"--expect");
-        std::wstring expectGone2 = args.Get(L"--expect-gone");
-        if (!expectText2.empty() || !expectGone2.empty()) {
-            int vt = args.GetInt(L"--expect-timeout", 3000);
-            int rc = GuardVerify(expectText2, expectGone2, vt, 0);
-            if (rc == 4) {
-                wprintf(L"ABORTED\n");
-                return 4;
-            }
-            if (rc != 0) {
-                std::wstring shot = SaveFailureShot();
-                wprintf(L"VERIFY-FAILED\texpect=%ls expectGone=%ls timeout=%dms\n",
-                        expectText2.c_str(), expectGone2.c_str(), vt);
-                if (!shot.empty()) Say(L"现场截图: %ls", shot.c_str());
-                return 5;
-            }
-            wprintf(L"VERIFIED\n");
-        }
-        return 0;
-    };
-
-    // 1) UI Automation：标准控件的名字是准的，优先用它
-    if (via != L"OCR" && UiInit()) {
-        auto nodes = UiFind(needle, 300, 400);
-        if (!nodes.empty()) {
-            // 跳过不可见/不可用的，除非只剩它们
-            std::vector<UiNode> usable;
-            for (auto& n : nodes) if (n.enabled && !n.offscreen) usable.push_back(n);
-            if (usable.empty()) usable = nodes;
-
-            int idx = wanted;
-            if (idx < 0 || idx >= int(usable.size())) idx = 0;
-            const UiNode& n = usable[idx];
-
-            ClickHit h;
-            h.text = n.name;
-            h.box = n.rect;
-            h.score = 1.0;
-            h.via = L"ui";
-            h.invokable = n.invokable;
-            h.haveUi = true;
-            h.ui = n;
-            if (h.box.w > 0 && h.box.h > 0) return perform(h);
-        }
-    }
-
-    // 2) OCR
-    for (;;) {
-        OcrResult r = EyeRecognize(oreq);
-        if (!r.ok) { wprintf(L"ERR %ls\n", r.error.c_str()); return 3; }
-
-        auto hits = SieveFind(r.lines, needle, 8);
-        if (!hits.empty()) {
-            int idx = wanted;
-            if (idx < 0 || idx >= int(hits.size())) idx = 0;
-            const auto& h = hits[idx];
-
-            ClickHit ch;
-            ch.text = h.text;
-            ch.box = h.box;
-            ch.score = h.score;
-            ch.via = L"ocr";
-            return perform(ch);
-        }
-
-        if (timeout <= 0 || int(GetTickCount() - start) > timeout) {
-            LogV(L"感知", 3005, L"感知", L"查找未命中",
-                 L"%ls ms=%lu", LogRedactText(needle).c_str(),
-                 (unsigned long)(GetTickCount() - start));
-            if (g_opt.json) {
-                JsonDoc d;
-                d.Bool(L"ok", false).Str(L"error", L"not found");
-                wprintf(L"%ls\n", d.Emit().c_str());
-            } else {
-                wprintf(L"NOTFOUND\t%ls\n", needle.c_str());
-            }
-            return 1;
-        }
-        Sleep(300);
-    }
-}
-
-// ------------------------------ ui：控件树调试 ------------------------------
-
-static int CmdUi(const ArgList& args) {
-    if (!UiInit()) {
-        wprintf(L"ERR UI Automation 不可用（COM 初始化失败）\n");
-        return 3;
-    }
-    int depth = args.GetInt(L"--depth", 8);
-    int maxNodes = args.GetInt(L"--max", 800);
-    std::wstring filter = args.Get(L"--text");
-
-    auto nodes = UiTree(nullptr, depth, maxNodes, 1500);
-    LogV(L"感知", 3013, L"感知", L"UI 控件树", L"nodes=%zu ms=0", nodes.size());
-    if (!filter.empty()) {
-        std::vector<UiNode> keep;
-        for (auto& n : nodes) if (n.name.find(filter) != std::wstring::npos) keep.push_back(n);
-        nodes.swap(keep);
-    }
-
-    if (g_opt.json) {
-        std::wstring arr = L"[";
-        for (size_t i = 0; i < nodes.size(); ++i) {
-            if (i) arr += L",";
-            arr += L"{\"role\":\"" + JsonStr(nodes[i].role) + L"\"";
-            arr += L",\"name\":\"" + JsonStr(nodes[i].name) + L"\"";
-            arr += L",\"value\":\"" + JsonStr(nodes[i].value) + L"\"";
-            arr += L",\"x\":" + std::to_wstring(nodes[i].rect.x);
-            arr += L",\"y\":" + std::to_wstring(nodes[i].rect.y);
-            arr += L",\"w\":" + std::to_wstring(nodes[i].rect.w);
-            arr += L",\"h\":" + std::to_wstring(nodes[i].rect.h);
-            arr += std::wstring(L",\"enabled\":") + (nodes[i].enabled ? L"true" : L"false");
-            arr += std::wstring(L",\"invokable\":") + (nodes[i].invokable ? L"true" : L"false");
-            arr += L"}";
-        }
-        arr += L"]";
-        JsonDoc d;
-        d.Bool(L"ok", true).Int(L"count", (long long)nodes.size());
-        d.Raw(L"nodes", arr);
-        wprintf(L"%ls\n", d.Emit().c_str());
-    } else {
-        for (const auto& n : nodes) {
-            wprintf(L"[%ls] %ls @%d,%d %dx%d%ls%ls\n",
-                    n.role.c_str(), n.name.c_str(), n.rect.x, n.rect.y, n.rect.w, n.rect.h,
-                    n.invokable ? L" invoke" : L"",
-                    n.value.empty() ? L"" : (L" value=" + n.value).c_str());
-        }
-        if (nodes.empty()) {
-            wprintf(L"（当前窗口没有可读的控件）\n");
-            return 1;
-        }
-    }
-    return 0;
-}
-
-// ------------------------------ read-text ------------------------------
-
-static int CmdReadText(const ArgList& args) {
-    std::wstring window = args.Get(L"--window");
-    std::wstring method = ToUpper(args.Get(L"--method", L"auto"));
-    int timeoutMs = args.GetInt(L"--timeout", 2000);
-    if (method.empty()) method = L"AUTO";
-
-    if (!window.empty()) {
-        InputInit();
-        FocusWindow(window, 800);
-        InputShutdown();
-    }
-
-    if (!UiInit()) {
-        if (method != L"COPY") {
-            wprintf(L"ERR UI Automation 不可用；可以试 --method copy\n");
-            return 3;
-        }
-    }
-
-    std::wstring text;
-    std::wstring via;
-
-    if (method != L"COPY") {
-        if (UiFocusedText(text) && !text.empty()) {
-            via = L"uia-focus";
-        } else {
-            // 前台窗口文档里的文字
-            auto nodes = UiTree(nullptr, 8, 400, 800);
-            std::wstring buf;
-            for (const auto& n : nodes) {
-                if (n.role != L"document" && n.role != L"text" && n.role != L"edit") continue;
-                std::wstring t;
-                if (UiGetText(n, t) && !t.empty()) { buf += t; buf += L"\n"; }
-            }
-            if (!buf.empty()) { text = buf; via = L"uia-window"; }
-        }
-    }
-
-    // 只有显式 --method copy 才动剪贴板：它会全选，是有副作用的
-    if (text.empty() && method == L"COPY") {
-        ClipSnapshot snap = ClipTake();
-        DWORD seq0 = GetClipboardSequenceNumber();
-
-        InputInit();
-        PressKeyCombo(L"CTRL+A");
-        Sleep(80);
-        PressKeyCombo(L"CTRL+C");
-        InputShutdown();
-
-        DWORD t0 = GetTickCount();
-        bool changed = false;
-        while ((int)(GetTickCount() - t0) < timeoutMs) {
-            if (GetClipboardSequenceNumber() != seq0) { changed = true; break; }
-            Sleep(30);
-        }
-        if (changed) ClipGetText(text);
-        ClipRestore(snap);
-        if (!text.empty()) via = L"copy";
-    }
-
-    if (text.empty()) {
-        if (g_opt.json) {
-            JsonDoc d;
-            d.Bool(L"ok", false).Str(L"error", L"没有读到文字");
-            wprintf(L"%ls\n", d.Emit().c_str());
-        } else {
-            wprintf(L"ERR 没有读到文字（该控件可能不支持文本读取；试 --method copy）\n");
-        }
-        return 1;
-    }
-
-    LogI(L"感知", 3014, L"感知", L"读取文字", L"via=%ls chars=%zu", via.c_str(), text.size());
-
-    if (g_opt.json) {
-        JsonDoc d;
-        d.Bool(L"ok", true).Int(L"chars", (long long)text.size());
-        d.Str(L"text", text).Str(L"via", via);
-        wprintf(L"%ls\n", d.Emit().c_str());
-    } else {
-        wprintf(L"%ls\n", text.c_str());
-    }
-    return 0;
-}
-
-// 日志里的命令行脱敏：--log-text mask/off 时不要把用户输入的文字原样落盘。
-// 以前 argv 是无条件写进 8000 事件的，和 README 承诺的脱敏对不上。
-static std::wstring RedactArgv(const std::vector<std::wstring>& raw) {
-    if (raw.empty()) return L"";
-    if (g_log.textMode == LOG_TEXT_FULL) {
-        std::wstring s;
-        for (size_t i = 0; i < raw.size(); ++i) {
-            if (i) s += L" ";
-            s += raw[i];
-        }
-        return s;
-    }
-    std::wstring s = raw[0];
-    int hidden = 0;
-    for (size_t i = 1; i < raw.size(); ++i) {
-        if (!raw[i].empty() && raw[i][0] == L'-') { s += L" "; s += raw[i]; }
-        else ++hidden;
-    }
-    if (hidden > 0) {
-        s += L" ***";
-        if (hidden > 1) s += L" x" + std::to_wstring(hidden);
-    }
+    s += L"]";
     return s;
 }
 
-// 出问题的时候留一张现场图，比事后问"当时屏幕上是什么"有用得多
-static std::wstring SaveFailureShot() {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t name[80] = {};
-    swprintf_s(name, L"fail_%04d%02d%02d_%02d%02d%02d.png",
-               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    std::wstring path = HandeyeStateDir() + L"\\" + name;
-    return EyeSavePng(path, RectI{}) ? path : L"";
+static std::wstring UiJson(const std::vector<UiNode>& nodes) {
+    std::wstring s = L"[";
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        if (i) s += L",";
+        const UiNode& n = nodes[i];
+        s += L"{\"name\":\"" + JsonStr(n.name) + L"\"";
+        s += L",\"role\":\"" + JsonStr(n.role) + L"\"";
+        s += L",\"value\":\"" + JsonStr(n.value) + L"\"";
+        s += L",\"x\":" + std::to_wstring(n.rect.x);
+        s += L",\"y\":" + std::to_wstring(n.rect.y);
+        s += L",\"w\":" + std::to_wstring(n.rect.w);
+        s += L",\"h\":" + std::to_wstring(n.rect.h);
+        s += n.enabled ? L",\"enabled\":true" : L",\"enabled\":false";
+        s += n.offscreen ? L",\"offscreen\":true" : L",\"offscreen\":false";
+        s += n.invokable ? L",\"invokable\":true" : L",\"invokable\":false";
+        s += L"}";
+    }
+    s += L"]";
+    return s;
+}
+
+static std::wstring WindowsJson(const std::vector<WinInfo>& wins) {
+    std::wstring s = L"[";
+    for (size_t i = 0; i < wins.size(); ++i) {
+        if (i) s += L",";
+        const WinInfo& w = wins[i];
+        s += L"{\"title\":\"" + JsonStr(w.title) + L"\"";
+        s += L",\"x\":" + std::to_wstring(w.rect.x);
+        s += L",\"y\":" + std::to_wstring(w.rect.y);
+        s += L",\"w\":" + std::to_wstring(w.rect.w);
+        s += L",\"h\":" + std::to_wstring(w.rect.h);
+        s += L",\"z\":" + std::to_wstring(w.z);
+        s += L"}";
+    }
+    s += L"]";
+    return s;
+}
+
+static int FailJson(const wchar_t* op, const wchar_t* error, int rc) {
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", op)
+     .Bool(L"ok", false).Int(L"rc", rc).Str(L"error", error);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return rc;
+}
+
+static int CmdCapture(const ArgList& args) {
+    RectI region{};
+    std::wstring rs = args.Get(L"--region");
+    if (!rs.empty() && !ParseRect(rs, region)) return FailJson(L"capture", L"bad --region", 1);
+
+    std::wstring save = args.Get(L"--save");
+    DWORD t0 = GetTickCount();
+    bool ok = true;
+    if (!save.empty()) ok = EyeSavePng(save, region);
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"capture").Bool(L"ok", ok);
+    d.Raw(L"screen", RectJson(EyeScreenRect()));
+    d.Raw(L"region", RectJson(region));
+    if (!save.empty()) d.Str(L"path", save);
+    d.Bool(L"saved", !save.empty() && ok);
+    d.Int(L"ms", (long long)(GetTickCount() - t0));
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return ok ? 0 : 3;
+}
+
+static int CmdOcr(const ArgList& args) {
+    RectI region{};
+    std::wstring rs = args.Get(L"--region");
+    if (!rs.empty() && !ParseRect(rs, region)) return FailJson(L"ocr", L"bad --region", 1);
+
+    DWORD t0 = GetTickCount();
+    OcrResult r;
+    std::wstring image = args.Get(L"--image");
+    if (!image.empty()) r = EyeRecognizeImageFile(image);
+    else {
+        OcrRequest req = BuildOcrRequest(args, region);
+        r = EyeRecognize(req);
+    }
+
+    if (!r.ok) return FailJson(L"ocr", r.error.empty() ? L"ocr failed" : r.error.c_str(), 3);
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"ocr").Bool(L"ok", true);
+    d.Raw(L"region", RectJson(r.region));
+    d.Int(L"scale", r.scale);
+    d.Int(L"raw", (long long)r.lines.size());
+    d.Raw(L"lines", LinesJson(r.lines));
+    d.Int(L"ms", (long long)(GetTickCount() - t0));
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 0;
+}
+
+static int CmdUia(const ArgList& args) {
+    if (!UiInit()) return FailJson(L"uia", L"ui automation unavailable", 3);
+    DWORD t0 = GetTickCount();
+    auto nodes = UiTree(nullptr,
+                        args.GetInt(L"--depth", 8),
+                        args.GetInt(L"--max", 800),
+                        args.GetInt(L"--timeout", 400));
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"uia").Bool(L"ok", true);
+    d.Str(L"window", GetForegroundTitle());
+    d.Int(L"nodes", (long long)nodes.size());
+    d.Raw(L"items", UiJson(nodes));
+    d.Int(L"ms", (long long)(GetTickCount() - t0));
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 0;
+}
+
+static int CmdWindows() {
+    DWORD t0 = GetTickCount();
+    auto wins = EnumTopWindows();
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"windows").Bool(L"ok", true);
+    d.Int(L"count", (long long)wins.size());
+    d.Raw(L"windows", WindowsJson(wins));
+    d.Int(L"ms", (long long)(GetTickCount() - t0));
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 0;
+}
+
+static int CmdCursor() {
+    POINT p = GetCursorPosNow();
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"cursor").Bool(L"ok", true);
+    d.Int(L"x", p.x).Int(L"y", p.y);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 0;
+}
+
+static int CmdForeground() {
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"foreground").Bool(L"ok", true);
+    d.Str(L"title", GetForegroundTitle());
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 0;
+}
+
+static int CmdClipboard() {
+    std::wstring text;
+    bool ok = ClipGetText(text);
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"clipboard").Bool(L"ok", ok);
+    d.Str(L"text", text);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return ok ? 0 : 3;
 }
 
 // ------------------------------ 能力自述 ------------------------------
@@ -1105,9 +370,8 @@ int wmain(int argc, wchar_t** argv) {
     // 只会 Say() 的命令（act / click / type / say / stop ...）在 --json 模式下
     // 本来什么都不输出，警告也一起丢了。这里补一个收尾对象，把 ok/rc/warnings 交代清楚。
     {
-        bool manualJson = (cmd == L"schema" || cmd == L"log" || cmd == L"doctor" ||
-                           cmd == L"bench" || cmd == L"gui" || cmd == L"help" ||
-                           cmd == L"--help" || cmd == L"-h");
+        bool manualJson = (cmd == L"schema" || cmd == L"doctor" ||
+                           cmd == L"help" || cmd == L"--help" || cmd == L"-h");
         if (g_opt.json && !manualJson && !JsonWasEmitted()) {
             JsonDoc d;
             d.Bool(L"ok", rc == 0);
@@ -1133,19 +397,16 @@ int wmain(int argc, wchar_t** argv) {
 static int Dispatch(const ArgList& args, const std::wstring& cmd) {
     if (cmd == L"help" || cmd == L"--help" || cmd == L"-h") { PrintUsage(); return 0; }
     if (cmd == L"schema") { PrintSchema(); return 0; }
-    if (cmd == L"log")   return CmdLogQuery(args.raw);
-    if (cmd == L"bench") return CmdBench(args.raw);
     if (cmd == L"doctor") return CmdDoctor(args.raw);
-    if (cmd == L"gui") {
-        // Hide the console the moment the window comes up, so double-clicking
-        // a shortcut does not leave a black box behind the window.
-        FreeConsole();
-        return RunGui();
-    }
-    if (cmd == L"see") return CmdSee(args);
-    if (cmd == L"click-text" || cmd == L"clicktext") return CmdClickText(args);
-    if (cmd == L"ui") return CmdUi(args);
-    if (cmd == L"read-text" || cmd == L"readtext") return CmdReadText(args);
+
+    // ---------- 采集（raw） ----------
+    if (cmd == L"capture")    return CmdCapture(args);
+    if (cmd == L"ocr")        return CmdOcr(args);
+    if (cmd == L"uia")        return CmdUia(args);
+    if (cmd == L"windows")    return CmdWindows();
+    if (cmd == L"cursor")     return CmdCursor();
+    if (cmd == L"foreground") return CmdForeground();
+    if (cmd == L"clipboard")  return CmdClipboard();
 
     auto pos = args.Positional();   // pos[0] 是命令本身
 
