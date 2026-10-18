@@ -92,7 +92,8 @@ public projection contract.
 
 ## Current status
 
-- P0 skeleton (named pipe, one worker, `yx status`) exists.
-- The `handeye` command surface still contains the old processing commands in
-  this development snapshot. They are being removed in the next commits.
-- `framing`, `zoom`, and `log verify` are the next milestones.
+- `handeye 1.2` is trimmed to raw collection and execution. It no longer
+  contains the sieve, click-text, read-text, log query, tray, or benchmark.
+- `yx 0.1` has `serve`, `status`, `framing` (L0/L1/L2), and `zoom`.
+- The ledger hash chain and `log verify` are not implemented yet.
+- `watch`, text compression, words, memory, tray, HTTP, and GPU are postponed.

@@ -1,15 +1,12 @@
 // ============================================================================
-//  main.cpp —— handeye 命令行入口
+//  main.cpp —— handeye 命令行入口（器官层）
 //
-//  目标：让 AI（任何模型，不绑定厂商）能低成本地"看"屏幕、"动"鼠标键盘、
-//        并且把观察结果先经过一层筛子再交出去。
+//  只做两件事：采集、执行。不筛、不排序、不摘要、不验证、不记账。
+//  需要视图/账本请用 yx。
 //
 //  命令：
-//    see   感知：截屏 + OCR + 筛子
-//    act   执行脚本
-//    click / type / key   单步动作
-//    say   语音播报
-//    rec / play / stop    录制回放
+//    capture / ocr / uia / windows / cursor / foreground / clipboard
+//    click / move / type / key / focus / act / say / rec / play / stop
 // ============================================================================
 #include "common.h"
 #include "eye.h"

@@ -416,7 +416,7 @@ static std::wstring FrameResponse(const std::wstring& id, const std::wstring& op
     d.Str(L"text", text);
     d.Raw(L"delta", delta);
     d.Raw(L"alarms", AlarmsJson(alarms));
-    d.Int(L"lines", (long long)f.ocr.lines.size());
+    d.Int(L"line_count", (long long)f.ocr.lines.size());
     d.Int(L"ui_nodes", (long long)f.ui.size());
     d.Int(L"ms", (long long)ms);
 

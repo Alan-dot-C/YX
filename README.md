@@ -1,147 +1,75 @@
 # YX
 
-**A local perception and audit layer for AI agents.**
+给 AI 用的一双眼睛。
 
-YX sits between an AI client and Windows. It lets the client ask *"what is on
-screen?"*, *"zoom into that"*, and *"show me what happened"* through a small,
-stable JSON contract. It does not decide, summarize, or move the mouse.
-
-The goal is not another GUI agent. The goal is a **middle layer** that any
-agent can call: DSH, Codex, a local script, or something not written yet.
-
-> Status: **v0.1 in development.** The repository currently contains the
-> clean scaffold and the first `yx status` server/client. `framing`, `zoom`,
-> and the ledger are the next commits. Do not treat this snapshot as a
-> finished release.
-
-## Two layers
+你让 AI 看屏幕，它不用先截一张几 MB 的图再自己猜。YX 把当前屏幕压成一句话：
 
 ```
-AI client (DSH, Codex, custom)   understands, decides
-             |
-             |  CLI / named pipe / JSON
-             v
-YX          thalamus + hippocampus + ledger
-             attention, working memory, audit
-             |
-             v
-handeye     senses + hands
-             screen capture, OCR, UIA, mouse, keyboard
+[L0] 窗口「另存为」| 可操作 3 项 | 无错误
 ```
 
-- **handeye 1.2** is the organ layer: capture and execute only. It keeps raw
-  output and local reflexes; it does not sieve, rank, summarize, or verify.
-- **YX** is the middle layer: it gates attention, projects a frame into L0/L1,
-  caches recent frames, and keeps a tamper-evident log. It never understands
-  the screen and never acts.
-- The AI is the part that understands. YX exists to make its senses cheap and
-  its actions auditable.
+需要细节时再 `yx zoom`，拿回原始 OCR 行和控件树。
 
-## Why another layer
+## 现在能做什么
 
-Most GUI agents are end-to-end: screenshot in, action out. That is expensive,
-non-deterministic, and impossible to audit. YX takes the opposite route:
+- `yx framing --level L0|L1|L2`：取一帧，按级别给视图
+- `yx zoom --ref <ref>`：按引用回 L2，不重新截屏
+- `yx status`：服务在不在、版本、管道、数据目录
+- `handeye`：截屏、OCR、UIA、窗口、光标、剪贴板；点击、输入、按键、脚本、语音
+- 任何 AI 都能调：命令行或命名管道 `\\.\pipe\yx-<用户名>`
 
-- **Projection, not summary.** Same input, same output. No model in the loop.
-- **Alarm channel never downsampled.** Dialogs, error words, dialog buttons,
-  numeric changes, and new windows survive every compression level.
-- **One place acts.** Only handeye moves the mouse or types.
-- **One place records.** YX writes the ledger; the client can verify it.
+## 跑起来
 
-## Build
+需要 Windows 10/11，装好 Windows 的 OCR 语言包（中文/英文）。
 
-Requirements:
+```powershell
+.\yx.exe serve
+```
 
-- Windows 10/11
-- Visual Studio 2022 with **Desktop development with C++**
-- Windows OCR language pack for the languages you want to read
-- No third-party libraries, no network access in the core path
+另开一个窗口：
 
-From a normal PowerShell:
+```powershell
+.\yx.exe framing --level L0
+```
+
+或者双击 `demo.bat`：它会启动服务并打印一条 L0。
+
+## 自己编译
+
+需要 Visual Studio 2022 的“使用 C++ 的桌面开发”。
 
 ```powershell
 .\build.ps1
 ```
 
-Or from an **x64 Native Tools Command Prompt for VS**:
+产物是 `handeye.exe` 和 `yx.exe`。
 
-```bat
-build.bat
-```
+## 它不是什么
 
-Outputs:
+- 不是截图工具：它给的是投影，不是原图。
+- 不是一个模型：同输入同输出，不联网，不调用大模型。
+- 不是大厂项目：没有 CI、没有企业级部署、没有“生产可用”的承诺。
+  它先给你自己的电脑用。
 
-```
-handeye.exe
-yx.exe
-```
+## 现在不做
 
-## Quick start
+文本压缩、词化/记忆、账本哈希链、托盘、本地 HTTP、GPU OCR。
+这些以后再说，v0.1 只做“能看见、能点、能演示”。
 
-```powershell
-# Check the senses and the environment
-.\handeye.exe doctor
+## 两个程序
 
-# Start the resident service (one per user)
-.\yx.exe serve
+- `handeye`：器官。只采集和执行，不整理、不判断、不记账。
+- `yx`：中枢。把一次采集投影成 L0/L1/L2，管最近几帧，按 `ref` 回看。
 
-# In another terminal: ask for status
-.\yx.exe status
+AI 是皮层：它负责理解和决定。YX 不替它理解。
 
-# Stop the service with Ctrl+C
-```
+## 限制
 
-`yx status` works even when the service is not running: it prints a local
-fallback with `"server": false` instead of blocking.
-
-## Any agent can call it
-
-YX is deliberately not tied to one client. There are two entry points:
-
-1. **CLI** — easiest for Codex, shell scripts, and humans:
-   ```powershell
-   .\yx.exe status
-   ```
-2. **Named pipe** — for long-running clients:
-   ```
-   \\.\pipe\yx-<user>
-   ```
-   Framing: `u32` length prefix + UTF-8 JSON, one request and one response per
-   message. The exact schema will be frozen in `docs/protocol.md` with the
-   first `framing` commit.
-
-A client only needs to know the command names and the JSON fields. There is no
-SDK, no Python dependency, and no DSH-specific code.
-
-## Scope of v0.1
-
-In:
-
-- `yx status` — server state, local fallback.
-- `yx framing` — L0 / L1 projections from one capture (next).
-- `yx zoom` — return L2 from the cached frame, without recapturing (next).
-- `yx log verify` — FNV-1a hash chain plus a `logs\head` anchor (next).
-- `handeye` — raw capture / OCR / UIA and low-level actions.
-
-Out:
-
-- text-file compression
-- word/skill learning and memory
-- tray icon, local HTTP, Event Viewer integration
-- GPU OCR
-- any claim of being "tamper-proof"
-
-These are intentionally postponed. v0.1 is the smallest thing that is useful
-and can be published.
-
-## Design documents
-
-- [`docs/architecture.md`](docs/architecture.md) — layer contract and the
-  rules each layer must not break.
-- `docs/protocol.md` — pipe contract (coming with `framing`).
-- `docs/limitations.md` — what the ledger can and cannot prove (coming with
-  the ledger).
+- L0 是启发式，不是“保证看懂”；复杂界面会不准。
+- UI Automation 在不同软件里质量差别很大。
+- 报警通道（对话框、错误词、新窗口）优先保留，所以有时候 L0 会超过一行。
+- 现在没有账本链；`yx.log` 只是普通七段日志。
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT。见 [LICENSE](LICENSE)。
