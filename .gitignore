@@ -1,0 +1,29 @@
+# Build output
+build/
+*.obj
+*.res
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+
+# Visual Studio / editor
+.vs/
+*.user
+*.suo
+.vscode/
+
+# Runtime data
+*.log
+tests/tmp/
+*.rec
+
+# Local screenshots and recordings (keep intentional docs assets)
+*.png
+*.jpg
+*.jpeg
+*.gif
+!docs/assets/
+!tests/corpus/
+!tests/corpus/*.png
