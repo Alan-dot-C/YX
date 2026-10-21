@@ -231,7 +231,13 @@ static bool HasErrorWord(const std::wstring& text) {
         L"错误", L"失败", L"警告", L"无法", L"拒绝", L"异常",
         L"ERROR", L"FAILED", L"DENIED", L"WARNING",
     };
+    // 先去掉“无错误/没有异常/0 个错误”这种否定句，否则状态行会被当成报警。
+    static const wchar_t* kNegations[] = {
+        L"无错误", L"没有错误", L"无异常", L"没有异常",
+        L"0 个错误", L"0个错误", L"无警告", L"NO ERROR", L"0 ERRORS",
+    };
     std::wstring upper = ToUpper(text);
+    for (const wchar_t* n : kNegations) ReplaceAll(upper, n, L"");
     for (const wchar_t* w : kWords) {
         if (upper.find(w) != std::wstring::npos) return true;
     }
