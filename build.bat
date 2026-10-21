@@ -29,7 +29,7 @@ rem Organs only: collect + execute. No sieve, no ledger, no verification.
 cl /nologo /utf-8 /std:c++20 /EHsc /O2 /MT /MP /Fo:build\handeye\ /Fe:handeye.exe ^
     src\common.cpp src\log.cpp src\eye.cpp src\uia.cpp src\winenum.cpp src\clip.cpp ^
     src\input.cpp src\mouth.cpp src\schema.cpp src\doctor.cpp src\main.cpp ^
-    windowsapp.lib gdi32.lib user32.lib ole32.lib advapi32.lib
+    windowsapp.lib gdi32.lib user32.lib ole32.lib advapi32.lib shell32.lib
 
 if errorlevel 1 (
     echo [FAILED]
@@ -40,7 +40,7 @@ echo Building yx.exe ...
 rem v0.1: one capture, L0/L1/L2 projections, zoom.
 cl /nologo /utf-8 /std:c++20 /EHsc /O2 /MT /MP /Fo:build\yx\ /Fe:yx.exe ^
     src\common.cpp src\log.cpp src\sieve.cpp src\eye.cpp src\uia.cpp src\winenum.cpp ^
-    src\yx\main.cpp ^
+    src\yx\main.cpp src\yx\words.cpp ^
     windowsapp.lib gdi32.lib user32.lib ole32.lib oleaut32.lib advapi32.lib
 
 if errorlevel 1 (

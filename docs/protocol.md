@@ -127,7 +127,39 @@ them.
 | 4 | ref expired or request timed out |
 | 6 | server not running (client-side only) |
 
-## Ledger (CLI only in v0.1)
+## Words / run / schema (CLI)
+
+```powershell
+yx words --json
+yx help devmgmt
+yx run devmgmt
+yx run ipconfig
+yx schema
+```
+
+`yx words --json` returns an array:
+
+```json
+[{"name":"devmgmt","category":"工具","desc":"设备管理器","kind":"open"}]
+```
+
+`yx run` returns:
+
+```json
+{"v":"1","tool":"yx","op":"run","ok":true,"word":"ipconfig",
+ "kind":"exec","exit":0,"timed_out":false,"ms":120,
+ "stdout":"...","stderr":"","truncated":false}
+```
+
+`open` words launch a target through handeye. `exec` words run a fixed
+`cmd.exe` command, capture up to 64 KB of output, and time out after 30
+seconds. There is no argument substitution: a word is a fixed command, not a
+template. Words are curated in the binary; AI cannot add them.
+
+`yx schema` is the machine-readable capability list (`ops`, `levels`, word
+count, exit codes).
+
+## Ledger (CLI only in v0.2)
 
 ```powershell
 yx log verify

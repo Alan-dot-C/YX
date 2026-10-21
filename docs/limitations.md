@@ -1,4 +1,4 @@
-# Known limitations (v0.1)
+# Known limitations (v0.2)
 
 This is a small, local tool. It is not a production security product.
 
@@ -32,6 +32,18 @@ This is a small, local tool. It is not a production security product.
 - L2 is capped by the pipe message size (1 MB) in the transport; a very dense
   screen can be truncated.
 
+## Words
+
+- The word table is curated and compiled in. Adding a word requires a rebuild;
+  AI cannot add words at runtime.
+- `open` targets depend on the Windows edition and version. `gpedit` and
+  `secpol` are not present on Home; some `ms-settings:` pages differ between
+  builds.
+- `exec` runs through `cmd.exe`, captures at most 64 KB of stdout/stderr, and
+  times out after 30 seconds. A non-zero exit code is reported as-is; it does
+  not always mean the command is broken.
+- There is no argument substitution. Words are fixed commands, not templates.
+
 ## Platform
 
 - Windows 10/11 only.
@@ -42,10 +54,10 @@ This is a small, local tool. It is not a production security product.
 - Per-monitor DPI is set by YX/handeye at process start. A client that
   captures coordinates from another DPI context may need to scale them.
 
-## Not in v0.1
+## Not in v0.2
 
 - Text-file compression
-- Word/skill learning and memory
+- AI-generated words and memory
 - Tray icon, local HTTP, Event Viewer integration
 - GPU OCR
 - `watch` / server push

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <winrt/base.h>
+#include <shellapi.h>
 
 // ------------------------------ 参数解析辅助 ------------------------------
 
@@ -288,6 +289,26 @@ static int CmdClipboard() {
     return ok ? 0 : 3;
 }
 
+static int CmdOpen(const ArgList& args) {
+    auto pos = args.Positional();
+    if (pos.size() < 2) return FailJson(L"open", L"usage: open <target> [--args ...]", 1);
+    std::wstring target = pos[1];
+    std::wstring extra = args.Get(L"--args");
+
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", target.c_str(),
+                                extra.empty() ? nullptr : extra.c_str(),
+                                nullptr, SW_SHOWNORMAL);
+    bool ok = (INT_PTR)r > 32;
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"open").Bool(L"ok", ok);
+    d.Str(L"target", target);
+    if (!extra.empty()) d.Str(L"args", extra);
+    if (!ok) d.Int(L"rc", 3);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return ok ? 0 : 3;
+}
+
 // ------------------------------ 能力自述 ------------------------------
 
 // 能力清单和帮助都从 schema.cpp 的同一张表生成。
@@ -404,6 +425,7 @@ static int Dispatch(const ArgList& args, const std::wstring& cmd) {
     if (cmd == L"cursor")     return CmdCursor();
     if (cmd == L"foreground") return CmdForeground();
     if (cmd == L"clipboard")  return CmdClipboard();
+    if (cmd == L"open")       return CmdOpen(args);
 
     auto pos = args.Positional();   // pos[0] 是命令本身
 

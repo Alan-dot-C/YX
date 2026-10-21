@@ -94,8 +94,11 @@ public projection contract.
 
 - `handeye 1.2` is trimmed to raw collection and execution. It no longer
   contains the sieve, click-text, read-text, log query, tray, or benchmark.
-- `yx 0.1` has `serve`, `status`, `framing` (L0/L1/L2), `zoom`, and
-  `log verify` (FNV-1a chain plus a `logs\head` anchor).
+- `yx 0.2` has `serve`, `status`, `framing` (L0/L1/L2), `zoom`,
+  `log verify` (FNV-1a chain plus a `logs\head` anchor), and a curated
+  `words` table with `words` / `help` / `run` / `schema`.
+- The word table is human-curated. `open` goes through handeye; `exec` runs a
+  fixed `cmd.exe` command and captures its output. AI cannot add words.
 - The ledger is tamper-evident: it detects edits and truncation, but it is not
   a signature and not tamper-proof. See `docs/limitations.md`.
-- `watch`, text compression, words, memory, tray, HTTP, and GPU are postponed.
+- `watch`, text compression, memory, tray, HTTP, and GPU are postponed.

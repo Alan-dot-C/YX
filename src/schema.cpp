@@ -55,6 +55,11 @@ static const OptSpec kClickOpts[] = {
     { nullptr, false, nullptr }
 };
 
+static const OptSpec kOpenOpts[] = {
+    { L"--args", true, L"传给目标程序的参数（由调用方提供，不经过 shell 拼接）" },
+    { nullptr, false, nullptr }
+};
+
 static const OptSpec kSayOpts[] = {
     { L"--voice",     true,  L"语音名（见 voices）" },
     { L"--rate",      true,  L"语速 -10..10" },
@@ -91,6 +96,7 @@ static const CmdSpec kCmds[] = {
     { L"cursor",    L"cursor",                  L"当前鼠标坐标", nullptr },
     { L"foreground",L"foreground",              L"当前前台窗口标题", nullptr },
     { L"clipboard", L"clipboard",               L"读取剪贴板文本", nullptr },
+    { L"open",      L"open <target> [选项]",    L"打开设置页/工具/URI（ShellExecute）", kOpenOpts },
 
     // 执行
     { L"click",     L"click <x> <y> [选项]",    L"点击坐标", kClickOpts },

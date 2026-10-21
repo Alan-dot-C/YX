@@ -18,6 +18,7 @@
 #include "../sieve.h"
 #include "../uia.h"
 #include "../winenum.h"
+#include "words.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -36,7 +37,7 @@
 #include <winrt/base.h>
 #include <sddl.h>
 
-#define YX_VERSION L"0.1.0"
+#define YX_VERSION L"0.2.0"
 
 // ------------------------------ 名字与路径 ------------------------------
 
@@ -833,6 +834,246 @@ static int CmdLog(int argc, wchar_t** argv) {
 
 
 
+static bool GetFlag(int argc, wchar_t** argv, const wchar_t* name) {
+    for (int i = 2; i < argc; ++i) {
+        if (_wcsicmp(argv[i], name) == 0) return true;
+    }
+    return false;
+}
+
+static std::wstring ExeDir() {
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    std::wstring p(buf, n);
+    size_t s = p.find_last_of(L"\\/");
+    return s == std::wstring::npos ? L"." : p.substr(0, s);
+}
+
+static std::string ReadFileLimited(const std::wstring& path, size_t maxBytes, bool& truncated) {
+    truncated = false;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return "";
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) sz = 0;
+    size_t take = (size_t)sz;
+    if (take > maxBytes) { take = maxBytes; truncated = true; }
+    std::string out(take, '\0');
+    size_t got = take ? fread(&out[0], 1, take, f) : 0;
+    out.resize(got);
+    fclose(f);
+    return out;
+}
+
+// cmd.exe 有的程序输出 UTF-8，有的仍然按 OEM 代码页输出（中文 Windows 是 936）。
+// 先按 UTF-8 严格解码；失败再按 OEM 解一次。
+static std::wstring DecodeConsoleBytes(const std::string& bytes) {
+    if (bytes.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                                (int)bytes.size(), nullptr, 0);
+    UINT cp = CP_UTF8;
+    if (n <= 0) {
+        cp = CP_OEMCP;
+        n = MultiByteToWideChar(cp, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    }
+    if (n <= 0) return L"";
+    std::wstring out((size_t)n, L'\0');
+    MultiByteToWideChar(cp, 0, bytes.data(), (int)bytes.size(), &out[0], n);
+    return out;
+}
+
+static bool RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs,
+                              std::string& out, std::string& err,
+                              DWORD& exitCode, bool& timedOut, bool& truncated) {
+    out.clear();
+    err.clear();
+    exitCode = 1;
+    timedOut = false;
+    truncated = false;
+
+    wchar_t tmp[MAX_PATH] = {};
+    if (GetTempPathW(MAX_PATH, tmp) == 0) return false;
+    std::wstring base = std::wstring(tmp) + L"yx-" + std::to_wstring(GetCurrentProcessId()) +
+                        L"-" + std::to_wstring(GetTickCount());
+    std::wstring outPath = base + L"-out.txt";
+    std::wstring errPath = base + L"-err.txt";
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE hOut = CreateFileW(outPath.c_str(), GENERIC_WRITE | GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    HANDLE hErr = CreateFileW(errPath.c_str(), GENERIC_WRITE | GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    HANDLE hNul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              &sa, OPEN_EXISTING, 0, nullptr);
+    if (hOut == INVALID_HANDLE_VALUE || hErr == INVALID_HANDLE_VALUE) {
+        if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
+        if (hErr != INVALID_HANDLE_VALUE) CloseHandle(hErr);
+        if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+        DeleteFileW(outPath.c_str());
+        DeleteFileW(errPath.c_str());
+        return false;
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hNul;
+    si.hStdOutput = hOut;
+    si.hStdError = hErr;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
+    mutableCmd.push_back(0);
+
+    BOOL created = CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE,
+                                  CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(hOut);
+    CloseHandle(hErr);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+
+    if (!created) {
+        DeleteFileW(outPath.c_str());
+        DeleteFileW(errPath.c_str());
+        err = "CreateProcess failed";
+        return false;
+    }
+
+    DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs);
+    if (wait == WAIT_TIMEOUT) {
+        timedOut = true;
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 2000);
+    }
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    bool t1 = false;
+    bool t2 = false;
+    out = ReadFileLimited(outPath, 64 * 1024, t1);
+    err = ReadFileLimited(errPath, 64 * 1024, t2);
+    truncated = t1 || t2;
+    DeleteFileW(outPath.c_str());
+    DeleteFileW(errPath.c_str());
+    return true;
+}
+
+static bool RunHandeyeOpen(const Word& w, DWORD& exitCode, std::string& out,
+                           std::string& err, bool& timedOut, bool& truncated) {
+    std::wstring exe = ExeDir() + L"\\handeye.exe";
+    std::wstring cmd = L"\"" + exe + L"\" open \"" + w.target + L"\"";
+    if (w.args && w.args[0]) cmd += L" --args \"" + std::wstring(w.args) + L"\"";
+    return RunProcessCapture(cmd, 15000, out, err, exitCode, timedOut, truncated);
+}
+
+static int CmdWords(int argc, wchar_t** argv) {
+    bool json = GetFlag(argc, argv, L"--json");
+    const auto& words = AllWords();
+    if (json) {
+        std::wstring s = L"[";
+        for (size_t i = 0; i < words.size(); ++i) {
+            if (i) s += L",";
+            const Word& w = words[i];
+            s += L"{\"name\":\"" + JsonStr(w.name) + L"\"";
+            s += L",\"category\":\"" + JsonStr(w.category) + L"\"";
+            s += L",\"desc\":\"" + JsonStr(w.desc) + L"\"";
+            s += L",\"kind\":\"";
+            s += (w.kind == WordKind::Open) ? L"open" : L"exec";
+            s += L"\"}";
+        }
+        s += L"]";
+        wprintf(L"%ls\n", s.c_str());
+        return 0;
+    }
+
+    wprintf(L"%-22ls %-6ls %ls\n", L"name", L"kind", L"description");
+    for (const auto& w : words) {
+        wprintf(L"%-22ls %-6ls %ls\n", w.name,
+                (w.kind == WordKind::Open) ? L"open" : L"exec", w.desc);
+    }
+    wprintf(L"\n共 %zu 个词。用 yx run <name> 执行。\n", words.size());
+    return 0;
+}
+
+static int CmdWordHelp(int argc, wchar_t** argv) {
+    std::wstring name = argc > 2 ? argv[2] : GetOpt(argc, argv, L"--word");
+    const Word* w = FindWord(name);
+    if (!w) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"help").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"error", L"unknown word: " + name);
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"help").Bool(L"ok", true);
+    d.Str(L"name", w->name).Str(L"category", w->category).Str(L"desc", w->desc);
+    d.Str(L"kind", w->kind == WordKind::Open ? L"open" : L"exec");
+    d.Str(L"usage", std::wstring(L"yx run ") + w->name);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 0;
+}
+
+static int CmdRun(int argc, wchar_t** argv) {
+    std::wstring name = argc > 2 ? argv[2] : GetOpt(argc, argv, L"--word");
+    const Word* w = FindWord(name);
+    if (!w) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"run").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"error", L"unknown word: " + name);
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+
+    DWORD t0 = GetTickCount();
+    DWORD exitCode = 1;
+    bool timedOut = false;
+    bool truncated = false;
+    bool okProcess = false;
+    std::string out;
+    std::string err;
+
+    if (w->kind == WordKind::Open) {
+        okProcess = RunHandeyeOpen(*w, exitCode, out, err, timedOut, truncated);
+    } else {
+        std::wstring cmd = L"cmd.exe /d /s /c \"chcp 65001 >nul && ";
+        cmd += w->target;
+        cmd += L"\"";
+        okProcess = RunProcessCapture(cmd, 30000, out, err, exitCode, timedOut, truncated);
+    }
+
+    bool ok = okProcess && !timedOut && exitCode == 0;
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"run").Bool(L"ok", ok);
+    d.Str(L"word", w->name).Str(L"kind", w->kind == WordKind::Open ? L"open" : L"exec");
+    d.Int(L"exit", exitCode).Bool(L"timed_out", timedOut);
+    d.Int(L"ms", (long long)(GetTickCount() - t0));
+    d.Str(L"stdout", DecodeConsoleBytes(out)).Str(L"stderr", DecodeConsoleBytes(err));
+    d.Bool(L"truncated", truncated);
+    if (!okProcess) d.Int(L"rc", 3);
+    else if (timedOut) d.Int(L"rc", 4);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return ok ? 0 : (timedOut ? 4 : 3);
+}
+
+static int CmdSchema() {
+    std::wstring s = L"{\"v\":\"1\",\"tool\":\"yx\",\"version\":\"";
+    s += YX_VERSION;
+    s += L"\",\"ops\":[\"status\",\"framing\",\"zoom\",\"words\",\"help\",\"run\",\"log.verify\"],";
+    s += L"\"levels\":[\"L0\",\"L1\",\"L2\"],\"words\":";
+    s += std::to_wstring(AllWords().size());
+    s += L",\"exit_codes\":{\"0\":\"ok\",\"1\":\"bad argument\",\"3\":\"capture/exec failed\",";
+    s += L"\"4\":\"timeout or expired ref\",\"5\":\"ledger verify failed\",\"6\":\"server not running\"}}";
+    wprintf(L"%ls\n", s.c_str());
+    return 0;
+}
+
 // ------------------------------ 入口 ------------------------------
 
 static void PrintUsage() {
@@ -842,6 +1083,10 @@ static void PrintUsage() {
     wprintf(L"  yx status                         问常驻进程要状态（没开就本地回一份）\n");
     wprintf(L"  yx framing [--level L0|L1|L2]     取一帧；默认 L0\n");
     wprintf(L"  yx zoom --ref <ref>               按 ref 回 L2，不重新截屏\n");
+    wprintf(L"  yx words [--json]                 列出 Windows 命令词\n");
+    wprintf(L"  yx help <词>                      看单个词的说明\n");
+    wprintf(L"  yx run <词>                       执行一个词（打开设置页或跑诊断命令）\n");
+    wprintf(L"  yx schema                         给 AI 的能力清单（JSON）\n");
     wprintf(L"  yx log verify [--dir <目录>]      校验账本哈希链和 head 锚\n");
     wprintf(L"  yx help                           这份帮助\n\n");
     wprintf(L"管道协议：u32 长度前缀 + UTF-8 JSON\n");
@@ -866,8 +1111,15 @@ int wmain(int argc, wchar_t** argv) {
     g_startTick = GetTickCount();
 
     int rc = 0;
-    if (cmd.empty() || cmd == L"help" || cmd == L"--help" || cmd == L"-h") {
+    if (cmd.empty()) {
         PrintUsage();
+    } else if (cmd == L"help" || cmd == L"--help" || cmd == L"-h") {
+        if (argc > 2) {
+            rc = CmdWordHelp(argc, argv);
+        } else {
+            PrintUsage();
+            rc = 0;
+        }
     } else if (cmd == L"serve") {
         rc = Serve();
     } else if (cmd == L"status") {
@@ -876,6 +1128,12 @@ int wmain(int argc, wchar_t** argv) {
         rc = CmdFraming(argc, argv);
     } else if (cmd == L"zoom") {
         rc = CmdZoom(argc, argv);
+    } else if (cmd == L"words") {
+        rc = CmdWords(argc, argv);
+    } else if (cmd == L"run") {
+        rc = CmdRun(argc, argv);
+    } else if (cmd == L"schema") {
+        rc = CmdSchema();
     } else if (cmd == L"log") {
         rc = CmdLog(argc, argv);
     } else {

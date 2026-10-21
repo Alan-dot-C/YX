@@ -74,5 +74,18 @@ Write-Host '8. handeye raw cursor'
 $cursor = Invoke-Json $he @('cursor')
 Assert-True ($cursor.ok -eq $true) 'handeye cursor failed'
 
+Write-Host '9. words table'
+$words = Invoke-Json $yx @('words', '--json')
+Assert-True ($words.Count -ge 100) "word table too small: $($words.Count)"
+$names = @($words | ForEach-Object { $_.name })
+Assert-True ($names -contains 'devmgmt') 'devmgmt word missing'
+$schema = Invoke-Json $yx @('schema')
+Assert-True ($schema.words -eq $words.Count) 'schema word count mismatch'
+
+Write-Host '10. run a read-only command'
+$who = Invoke-Json $yx @('run', 'whoami')
+Assert-True ($who.ok -eq $true) 'yx run whoami failed'
+Assert-True ($who.stdout -match 'User Name') 'whoami output missing User Name'
+
 Write-Host ''
 Write-Host 'ALL TESTS PASSED'

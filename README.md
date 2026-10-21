@@ -15,9 +15,25 @@
 - `yx framing --level L0|L1|L2`：取一帧，按级别给视图
 - `yx zoom --ref <ref>`：按引用回 L2，不重新截屏
 - `yx status`：服务在不在、版本、管道、数据目录
+- `yx words` / `yx words --json`：列出 140+ 个 Windows 命令词
+- `yx help <词>`：看单个词做什么
+- `yx run <词>`：执行；打开设置页/工具，或跑一条只读诊断命令并返回输出
+- `yx schema`：给 AI 的 JSON 能力清单
 - `yx log verify`：校验账本哈希链和 `head` 锚，改一行/删末行会报错
 - `handeye`：截屏、OCR、UIA、窗口、光标、剪贴板；点击、输入、按键、脚本、语音
 - 任何 AI 都能调：命令行或命名管道 `\\.\pipe\yx-<用户名>`
+
+## 给 AI 的词
+
+```powershell
+.\yx.exe run devmgmt     # 打开设备管理器
+.\yx.exe run settings    # 打开设置
+.\yx.exe run ipconfig    # 跑 ipconfig /all，返回 stdout
+.\yx.exe run whoami      # 当前用户和权限
+```
+
+词表是人工审核过的，AI 只发词名，不拼命令、不做参数替换。
+危险命令（格式化、关机、分区、删注册表）故意不放。
 
 ## 跑起来
 
@@ -61,8 +77,8 @@
 
 ## 现在不做
 
-文本压缩、词化/记忆、托盘、本地 HTTP、GPU OCR、账本的 HMAC/外部锚。
-这些以后再说，v0.1 只做“能看见、能点、能演示、账本改没改能查”。
+文本压缩、AI 自动生成词表、记忆、托盘、本地 HTTP、GPU OCR、账本的 HMAC/外部锚。
+这些以后再说，v0.2 先把“能看见、能点、能查、能用一句话开 Windows 功能”做稳。
 
 ## 两个程序
 
