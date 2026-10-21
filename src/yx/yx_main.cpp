@@ -40,7 +40,7 @@
 #include <winrt/base.h>
 #include <sddl.h>
 
-#define YX_VERSION L"0.4.0"
+#define YX_VERSION L"0.5.0"
 
 // ------------------------------ 名字与路径 ------------------------------
 
@@ -1004,6 +1004,192 @@ static bool CaptureForTask(const std::wstring& image, OcrResult& r) {
     return r.ok;
 }
 
+// ------------------------------ 重复记忆 ------------------------------
+//
+// 记录 AI 反复执行的动作；同一指纹第 5 次成功时进入 proposed。
+// 人工用 yx words accept 确认后，写入 words.user.txt，下次只发一个词。
+// 这里不做语义理解，只按“动作 + 规范化参数 + 图片”做指纹。
+
+struct RepeatItem {
+    std::wstring fp;
+    int          count = 0;
+    std::wstring state;      // observing / proposed / active / rejected
+    std::wstring action;
+    std::wstring arg;
+    std::wstring image;
+};
+
+struct UserWord {
+    std::wstring name;
+    std::wstring action;
+    std::wstring arg;
+    std::wstring image;
+};
+
+static std::wstring RepeatPath() { return DataDir() + L"\\repeat.txt"; }
+static std::wstring UserWordsPath() { return DataDir() + L"\\words.user.txt"; }
+
+static bool ReadTextFile(const std::wstring& path, std::wstring& out) {
+    out.clear();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz > 0) {
+        std::string bytes(size_t(sz), '\0');
+        size_t got = fread(&bytes[0], 1, size_t(sz), f);
+        bytes.resize(got);
+        out = FromUtf8(bytes);
+    }
+    fclose(f);
+    return true;
+}
+
+static bool WriteTextFile(const std::wstring& path, const std::wstring& text) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
+    std::string bytes = ToUtf8(text);
+    fwrite(bytes.data(), 1, bytes.size(), f);
+    fclose(f);
+    return true;
+}
+
+static std::wstring StripCr(std::wstring s) {
+    while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n')) s.pop_back();
+    return s;
+}
+
+static std::vector<RepeatItem> LoadRepeat() {
+    std::vector<RepeatItem> out;
+    std::wstring text;
+    if (!ReadTextFile(RepeatPath(), text)) return out;
+    for (auto& line : Split(text, L'\n')) {
+        auto p = Split(StripCr(line), L'\t');
+        if (p.size() < 6) continue;
+        RepeatItem it;
+        it.fp = p[0];
+        it.count = _wtoi(p[1].c_str());
+        it.state = p[2];
+        it.action = p[3];
+        it.arg = p[4];
+        it.image = StripCr(p[5]);
+        out.push_back(std::move(it));
+    }
+    return out;
+}
+
+static void SaveRepeat(const std::vector<RepeatItem>& items) {
+    std::wstring text;
+    for (const auto& it : items) {
+        text += it.fp + L"\t" + std::to_wstring(it.count) + L"\t" + it.state + L"\t" +
+                it.action + L"\t" + it.arg + L"\t" + it.image + L"\r\n";
+    }
+    WriteTextFile(RepeatPath(), text);
+}
+
+static std::wstring FnvHex(const std::wstring& s) {
+    uint64_t h = 0xCBF29CE484222325ULL;
+    std::string bytes = ToUtf8(s);
+    for (unsigned char c : bytes) {
+        h ^= (uint64_t)c;
+        h *= 0x100000001B3ULL;
+    }
+    wchar_t buf[32] = {};
+    swprintf_s(buf, L"%016llX", (unsigned long long)h);
+    return buf;
+}
+
+static std::wstring RecordRepeat(const std::wstring& action, const std::wstring& arg,
+                                 const std::wstring& image) {
+    if (arg.empty()) return L"";
+
+    HANDLE m = CreateMutexW(nullptr, FALSE, L"Local\\yx_repeat_mutex");
+    if (m) WaitForSingleObject(m, 2000);
+
+    auto items = LoadRepeat();
+    std::wstring key = action + L"|" + Compact(arg) + L"|" + image;
+    std::wstring fp = FnvHex(key);
+
+    RepeatItem* hit = nullptr;
+    for (auto& it : items) {
+        if (it.fp == fp) { hit = &it; break; }
+    }
+    if (!hit) {
+        RepeatItem it;
+        it.fp = fp;
+        it.state = L"observing";
+        it.action = action;
+        it.arg = arg;
+        it.image = image;
+        items.push_back(it);
+        hit = &items.back();
+    }
+
+    hit->count++;
+    std::wstring learn;
+    if (hit->count >= 5 && hit->state == L"observing") {
+        hit->state = L"proposed";
+        learn = L"{\"fingerprint\":\"" + fp + L"\",\"count\":" +
+                std::to_wstring(hit->count) + L",\"state\":\"proposed\"}";
+        fwprintf(stderr, L"[YX] 新词提议：%ls %ls（第 %d 次）\n",
+                 action.c_str(), arg.c_str(), hit->count);
+    } else if (hit->count >= 5 && hit->state == L"proposed") {
+        learn = L"{\"fingerprint\":\"" + fp + L"\",\"count\":" +
+                std::to_wstring(hit->count) + L",\"state\":\"proposed\"}";
+    }
+
+    SaveRepeat(items);
+    if (m) { ReleaseMutex(m); CloseHandle(m); }
+    return learn;
+}
+
+static std::vector<UserWord> LoadUserWords() {
+    std::vector<UserWord> out;
+    std::wstring text;
+    if (!ReadTextFile(UserWordsPath(), text)) return out;
+    for (auto& line : Split(text, L'\n')) {
+        auto p = Split(StripCr(line), L'\t');
+        if (p.size() < 4) continue;
+        UserWord w;
+        w.name = p[0];
+        w.action = p[1];
+        w.arg = p[2];
+        w.image = StripCr(p[3]);
+        out.push_back(std::move(w));
+    }
+    return out;
+}
+
+static const UserWord* FindUserWord(const std::wstring& name) {
+    static std::vector<UserWord> cache;
+    cache = LoadUserWords();
+    for (const auto& w : cache) {
+        if (_wcsicmp(w.name.c_str(), name.c_str()) == 0) return &w;
+    }
+    return nullptr;
+}
+
+static bool ValidWordName(const std::wstring& name) {
+    if (name.empty()) return false;
+    for (wchar_t c : name) {
+        if (!(iswalnum(c) || c == L'_' || c == L'-')) return false;
+    }
+    return true;
+}
+
+static bool SaveUserWord(const UserWord& w) {
+    auto items = LoadUserWords();
+    for (const auto& it : items) {
+        if (_wcsicmp(it.name.c_str(), w.name.c_str()) == 0) return false;
+    }
+    std::wstring text;
+    ReadTextFile(UserWordsPath(), text);
+    if (!text.empty() && text.back() != L'\n') text += L"\r\n";
+    text += w.name + L"\t" + w.action + L"\t" + w.arg + L"\t" + w.image + L"\r\n";
+    return WriteTextFile(UserWordsPath(), text);
+}
+
 static int CmdFind(int argc, wchar_t** argv) {
     std::wstring needle = (argc > 2 && argv[2][0] != L'-') ? argv[2] : GetOpt(argc, argv, L"--text");
     if (needle.empty()) {
@@ -1135,10 +1321,15 @@ static int CmdRead(int argc, wchar_t** argv) {
     }
     lines += L"]";
 
+    std::wstring learn = (count > 0 && !needle.empty())
+                             ? RecordRepeat(L"read", needle, image)
+                             : L"";
+
     JsonDoc d;
     d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"read").Bool(L"ok", count > 0);
     d.Str(L"find", needle).Str(L"text", text).Int(L"count", count);
     d.Raw(L"lines", lines);
+    if (!learn.empty()) d.Raw(L"learn", learn);
     wprintf(L"%ls\n", d.Emit().c_str());
     return count > 0 ? 0 : 1;
 }
@@ -1247,10 +1438,15 @@ static int CmdClickText(int argc, wchar_t** argv) {
     int verifyRc = 0;
     if (!dry) verifyRc = VerifyExpect(expectText, expectGone, expectTimeout);
 
+    std::wstring learn = (!dry && verifyRc == 0)
+                             ? RecordRepeat(L"click-text", needle, L"")
+                             : L"";
+
     JsonDoc d;
     d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"click-text");
     d.Bool(L"ok", verifyRc == 0).Str(L"text", needle).Str(L"via", via);
-    d.Int(L"x", x).Int(L"y", y).Bool(L"clicked", !dry);
+    d.Int(L"x", x).Int(L"y", y).Bool(L"clicked", !dry && image.empty());
+    if (!learn.empty()) d.Raw(L"learn", learn);
     if (verifyRc != 0) d.Int(L"rc", verifyRc).Str(L"error", L"expect failed");
     wprintf(L"%ls\n", d.Emit().c_str());
     return verifyRc;
@@ -1293,19 +1489,115 @@ static int CmdWait(int argc, wchar_t** argv) {
 }
 
 static int CmdWords(int argc, wchar_t** argv) {
+    std::wstring sub = (argc > 2 && argv[2][0] != L'-') ? ToUpper(argv[2]) : L"";
+
+    if (sub == L"PENDING") {
+        std::wstring s = L"[";
+        int n = 0;
+        for (const auto& it : LoadRepeat()) {
+            if (it.state != L"proposed") continue;
+            if (n++) s += L",";
+            s += L"{\"fingerprint\":\"" + it.fp + L"\"";
+            s += L",\"count\":" + std::to_wstring(it.count);
+            s += L",\"action\":\"" + JsonStr(it.action) + L"\"";
+            s += L",\"arg\":\"" + JsonStr(it.arg) + L"\"";
+            s += L",\"state\":\"proposed\"}";
+        }
+        s += L"]";
+        wprintf(L"%ls\n", s.c_str());
+        return 0;
+    }
+
+    if (sub == L"ACCEPT") {
+        if (argc < 5) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"words.accept").Bool(L"ok", false);
+            d.Int(L"rc", 1).Str(L"error", L"usage: yx words accept <fingerprint> <name>");
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 1;
+        }
+        std::wstring fp = argv[3];
+        std::wstring name = argv[4];
+        if (!ValidWordName(name)) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"words.accept").Bool(L"ok", false);
+            d.Int(L"rc", 1).Str(L"error", L"name must be letters/digits/_/-");
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 1;
+        }
+
+        auto items = LoadRepeat();
+        RepeatItem* hit = nullptr;
+        for (auto& it : items) if (it.fp == fp) { hit = &it; break; }
+        if (!hit) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"words.accept").Bool(L"ok", false);
+            d.Int(L"rc", 1).Str(L"error", L"fingerprint not found");
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 1;
+        }
+        UserWord w;
+        w.name = name;
+        w.action = hit->action;
+        w.arg = hit->arg;
+        w.image = hit->image;
+        if (!SaveUserWord(w)) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"words.accept").Bool(L"ok", false);
+            d.Int(L"rc", 1).Str(L"error", L"word already exists");
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 1;
+        }
+        hit->state = L"active";
+        SaveRepeat(items);
+
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"words.accept").Bool(L"ok", true);
+        d.Str(L"name", name).Str(L"action", w.action).Str(L"arg", w.arg);
+        d.Str(L"usage", L"yx run " + name);
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 0;
+    }
+
+    if (sub == L"REJECT") {
+        if (argc < 4) return 1;
+        std::wstring fp = argv[3];
+        auto items = LoadRepeat();
+        bool found = false;
+        for (auto& it : items) {
+            if (it.fp == fp) { it.state = L"rejected"; found = true; break; }
+        }
+        if (found) SaveRepeat(items);
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"words.reject").Bool(L"ok", found);
+        if (!found) d.Int(L"rc", 1).Str(L"error", L"fingerprint not found");
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return found ? 0 : 1;
+    }
+
     bool json = GetFlag(argc, argv, L"--json");
     const auto& words = AllWords();
+    auto user = LoadUserWords();
+
     if (json) {
         std::wstring s = L"[";
-        for (size_t i = 0; i < words.size(); ++i) {
-            if (i) s += L",";
-            const Word& w = words[i];
+        bool first = true;
+        for (const auto& w : words) {
+            if (!first) s += L",";
+            first = false;
             s += L"{\"name\":\"" + JsonStr(w.name) + L"\"";
             s += L",\"category\":\"" + JsonStr(w.category) + L"\"";
             s += L",\"desc\":\"" + JsonStr(w.desc) + L"\"";
             s += L",\"kind\":\"";
             s += (w.kind == WordKind::Open) ? L"open" : L"exec";
             s += L"\"}";
+        }
+        for (const auto& w : user) {
+            if (!first) s += L",";
+            first = false;
+            s += L"{\"name\":\"" + JsonStr(w.name) + L"\"";
+            s += L",\"category\":\"学习\",\"desc\":\"学习词\"";
+            s += L",\"kind\":\"learned\",\"action\":\"" + JsonStr(w.action) + L"\"}";
         }
         s += L"]";
         wprintf(L"%ls\n", s.c_str());
@@ -1317,7 +1609,11 @@ static int CmdWords(int argc, wchar_t** argv) {
         wprintf(L"%-22ls %-6ls %ls\n", w.name,
                 (w.kind == WordKind::Open) ? L"open" : L"exec", w.desc);
     }
-    wprintf(L"\n共 %zu 个词。用 yx run <name> 执行。\n", words.size());
+    for (const auto& w : user) {
+        wprintf(L"%-22ls %-6ls %ls\n", w.name.c_str(), L"learned", L"学习词");
+    }
+    wprintf(L"\n共 %zu 个词（静态 %zu + 学习 %zu）。用 yx run <name> 执行。\n",
+            words.size() + user.size(), words.size(), user.size());
     return 0;
 }
 
@@ -1325,6 +1621,16 @@ static int CmdWordHelp(int argc, wchar_t** argv) {
     std::wstring name = argc > 2 ? argv[2] : GetOpt(argc, argv, L"--word");
     const Word* w = FindWord(name);
     if (!w) {
+        const UserWord* u = FindUserWord(name);
+        if (u) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"help").Bool(L"ok", true);
+            d.Str(L"name", u->name).Str(L"category", L"学习").Str(L"desc", L"学习词");
+            d.Str(L"kind", L"learned").Str(L"action", u->action).Str(L"arg", u->arg);
+            d.Str(L"usage", std::wstring(L"yx run ") + u->name);
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 0;
+        }
         JsonDoc d;
         d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"help").Bool(L"ok", false);
         d.Int(L"rc", 1).Str(L"error", L"unknown word: " + name);
@@ -1344,6 +1650,33 @@ static int CmdRun(int argc, wchar_t** argv) {
     std::wstring name = argc > 2 ? argv[2] : GetOpt(argc, argv, L"--word");
     const Word* w = FindWord(name);
     if (!w) {
+        const UserWord* u = FindUserWord(name);
+        if (u) {
+            std::vector<std::wstring> store;
+            if (u->action == L"read") {
+                store = { L"yx", L"read", L"--find", u->arg };
+                if (!u->image.empty()) {
+                    store.push_back(L"--image");
+                    store.push_back(u->image);
+                }
+            } else if (u->action == L"click-text") {
+                store = { L"yx", L"click-text", u->arg };
+            } else if (u->action == L"wait") {
+                store = { L"yx", L"wait", u->arg };
+            } else {
+                JsonDoc d;
+                d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"run").Bool(L"ok", false);
+                d.Int(L"rc", 1).Str(L"error", L"unsupported learned action");
+                wprintf(L"%ls\n", d.Emit().c_str());
+                return 1;
+            }
+            std::vector<wchar_t*> av;
+            av.reserve(store.size());
+            for (auto& s : store) av.push_back(s.data());
+            if (u->action == L"read") return CmdRead((int)av.size(), av.data());
+            if (u->action == L"click-text") return CmdClickText((int)av.size(), av.data());
+            return CmdWait((int)av.size(), av.data());
+        }
         JsonDoc d;
         d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"run").Bool(L"ok", false);
         d.Int(L"rc", 1).Str(L"error", L"unknown word: " + name);
@@ -1385,9 +1718,9 @@ static int CmdRun(int argc, wchar_t** argv) {
 static int CmdSchema() {
     std::wstring s = L"{\"v\":\"1\",\"tool\":\"yx\",\"version\":\"";
     s += YX_VERSION;
-    s += L"\",\"ops\":[\"status\",\"framing\",\"zoom\",\"find\",\"read\",\"click-text\",\"wait\",\"words\",\"help\",\"run\",\"log.verify\"],";
+    s += L"\",\"ops\":[\"status\",\"framing\",\"zoom\",\"find\",\"read\",\"click-text\",\"wait\",\"words\",\"words.pending\",\"words.accept\",\"words.reject\",\"help\",\"run\",\"log.verify\"],";
     s += L"\"levels\":[\"L0\",\"L1\",\"L2\"],\"words\":";
-    s += std::to_wstring(AllWords().size());
+    s += std::to_wstring(AllWords().size() + LoadUserWords().size());
     s += L",\"organ\":[";
     bool first = true;
     for (const auto& c : CommandSpecs()) {
@@ -1416,6 +1749,8 @@ static void PrintUsage() {
     wprintf(L"  yx click-text <文字>              找到就点，可加 --expect\n");
     wprintf(L"  yx wait <文字> [--gone]           等文字出现/消失\n");
     wprintf(L"  yx words [--json]                 列出 Windows 命令词\n");
+    wprintf(L"  yx words pending                  看重复记忆的待确认词\n");
+    wprintf(L"  yx words accept <fp> <name>       确认一个学习词\n");
     wprintf(L"  yx help <词>                      看单个词的说明\n");
     wprintf(L"  yx run <词>                       执行一个词（打开设置页或跑诊断命令）\n");
     wprintf(L"  yx schema                         给 AI 的能力清单（JSON）\n");

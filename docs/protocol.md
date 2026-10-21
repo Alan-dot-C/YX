@@ -1,4 +1,4 @@
-# YX protocol (v0.4)
+# YX protocol (v0.5)
 
 Any AI client can use YX. There is no SDK and no vendor-specific dependency.
 
@@ -158,6 +158,30 @@ yx wait "完成" --timeout 10000
 target without clicking. `--expect` / `--expect-gone` poll the screen after the
 click and return exit code 5 on timeout. `wait` does the same polling without
 clicking; `--gone` waits for disappearance.
+
+## Repetition memory (CLI)
+
+`read` and `click-text` successes are recorded by fingerprint
+(`action + normalized argument + image`). The fifth success moves the entry to
+`proposed`:
+
+```powershell
+yx words pending
+yx words accept <fingerprint> balance
+yx words reject <fingerprint>
+yx run balance
+```
+
+`pending` returns:
+
+```json
+[{"fingerprint":"3EF8B8C3D9501D24","count":5,
+  "action":"read","arg":"余额","state":"proposed"}]
+```
+
+`accept` writes a learned word to `%LOCALAPPDATA%\yx\words.user.txt` and marks
+the fingerprint `active`; `reject` marks it `rejected` so it is not proposed
+again. The AI cannot accept a word by itself.
 
 ## Words / run / schema (CLI)
 

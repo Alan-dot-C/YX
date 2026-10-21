@@ -1,4 +1,4 @@
-# Known limitations (v0.4)
+# Known limitations (v0.5)
 
 This is a small, local tool. It is not a production security product.
 
@@ -44,6 +44,18 @@ This is a small, local tool. It is not a production security product.
   not always mean the command is broken.
 - There is no argument substitution. Words are fixed commands, not templates.
 
+## Repetition memory
+
+- Only `read` and `click-text` successes are recorded. Arbitrary shell
+  commands and `find` / `wait` are not.
+- The fingerprint is exact after normalization: `余额` and `余额 ` merge, but
+  `余额` and `账户余额` do not.
+- A proposal only appears after five successes; there is no decay, archive, or
+  degraded state yet.
+- A learned `read` word stores the image path if the original action used
+  `--image`. If that file is deleted, the learned word fails.
+- `accept` / `reject` are human commands. There is no tray prompt yet.
+
 ## Task commands
 
 - `find` / `read` / `wait` read the current foreground screen. Focus the
@@ -67,7 +79,7 @@ This is a small, local tool. It is not a production security product.
 - Per-monitor DPI is set by YX/handeye at process start. A client that
   captures coordinates from another DPI context may need to scale them.
 
-## Not in v0.4
+## Not in v0.5
 
 - Text-file compression
 - AI-generated words and memory

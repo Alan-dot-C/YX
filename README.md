@@ -20,6 +20,7 @@
 - `yx wait <文字>`：等文字出现，`--gone` 等它消失
 - `yx status`：服务在不在、版本、管道、数据目录
 - `yx words` / `yx words --json`：列出 30+ 个常用 Windows 命令词
+- `yx words pending / accept / reject`：重复记忆——同一动作第 5 次成功会提议一个词
 - `yx help <词>`：看单个词做什么
 - `yx run <词>`：执行；打开设置页/工具，或跑一条只读诊断命令并返回输出
 - `yx schema`：给 AI 的 JSON 能力清单
@@ -38,6 +39,19 @@
 
 词表是人工审核过的，AI 只发词名，不拼命令、不做参数替换。
 危险命令（格式化、关机、分区、删注册表）故意不放。
+
+## 重复记忆（试做）
+
+同一个动作（比如反复 `read --find 余额`）第 5 次成功，会生成一个提议：
+
+```powershell
+yx words pending
+yx words accept <fingerprint> balance
+yx run balance
+```
+
+提议存在 `%LOCALAPPDATA%\yx\repeat.txt`，确认后的词存在 `words.user.txt`。
+AI 不能自己确认；`accept` 必须由人执行。`reject` 后同一指纹不再提议。
 
 ## 定点读和点文字
 
@@ -93,8 +107,8 @@
 
 ## 现在不做
 
-文本压缩、AI 自动生成词表、记忆、托盘、本地 HTTP、GPU OCR、账本的 HMAC/外部锚。
-这些以后再说，v0.4 先把“一个 exe、能看见、能点、能查、能定点读”做稳。
+文本压缩、AI 自动生成/确认词表、复杂记忆（分层/遗忘）、托盘、本地 HTTP、GPU OCR、账本的 HMAC/外部锚。
+这些以后再说，v0.5 先把“一个 exe、能看见、能点、能查、能定点读、能记习惯”做稳。
 
 ## 一个程序，两层
 
