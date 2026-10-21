@@ -76,7 +76,7 @@ Assert-True ($cursor.ok -eq $true) 'handeye cursor failed'
 
 Write-Host '9. words table'
 $words = Invoke-Json $yx @('words', '--json')
-Assert-True ($words.Count -ge 100) "word table too small: $($words.Count)"
+Assert-True ($words.Count -ge 30) "word table too small: $($words.Count)"
 $names = @($words | ForEach-Object { $_.name })
 Assert-True ($names -contains 'devmgmt') 'devmgmt word missing'
 $schema = Invoke-Json $yx @('schema')

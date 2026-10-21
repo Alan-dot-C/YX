@@ -15,7 +15,7 @@
 - `yx framing --level L0|L1|L2`：取一帧，按级别给视图
 - `yx zoom --ref <ref>`：按引用回 L2，不重新截屏
 - `yx status`：服务在不在、版本、管道、数据目录
-- `yx words` / `yx words --json`：列出 140+ 个 Windows 命令词
+- `yx words` / `yx words --json`：列出 30+ 个常用 Windows 命令词
 - `yx help <词>`：看单个词做什么
 - `yx run <词>`：执行；打开设置页/工具，或跑一条只读诊断命令并返回输出
 - `yx schema`：给 AI 的 JSON 能力清单
