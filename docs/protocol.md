@@ -1,4 +1,4 @@
-# YX protocol (v0.1)
+# YX protocol (v0.2)
 
 Any AI client can use YX. There is no SDK and no vendor-specific dependency.
 
@@ -123,8 +123,9 @@ them.
 |---|---|
 | 0 | success |
 | 1 | bad argument or unknown op |
-| 3 | capture/OCR failed |
+| 3 | capture/OCR/exec failed |
 | 4 | ref expired or request timed out |
+| 5 | ledger verification failed |
 | 6 | server not running (client-side only) |
 
 ## Words / run / schema (CLI)
