@@ -1,4 +1,4 @@
-# YX protocol (v0.3)
+# YX protocol (v0.4)
 
 Any AI client can use YX. There is no SDK and no vendor-specific dependency.
 
@@ -127,6 +127,37 @@ them.
 | 4 | ref expired or request timed out |
 | 5 | ledger verification failed |
 | 6 | server not running (client-side only) |
+
+## Task commands (CLI)
+
+```powershell
+yx find 余额
+yx read --find 余额
+yx click-text 保存 --expect "已保存"
+yx wait "完成" --timeout 10000
+```
+
+`find` returns:
+
+```json
+{"ok":true,"op":"find","text":"余额","via":"ocr","count":2,
+ "matches":[{"text":"充值余额","x":395,"y":378,"w":199,"h":12,
+             "score":0.88,"via":"ocr"}]}
+```
+
+`read --find` returns only matching lines plus nearby lines in the same column:
+
+```json
+{"ok":true,"op":"read","find":"余额",
+ "text":"充 值 余 额\n¥ 62 · 52","count":2,
+ "lines":[{"text":"充 值 余 额","x":395,"y":378,"w":199,"h":12},
+          {"text":"¥ 62 · 52","x":394,"y":414,"w":98,"h":23}]}
+```
+
+`click-text` first tries UI Automation, then OCR. `--dry-run` reports the
+target without clicking. `--expect` / `--expect-gone` poll the screen after the
+click and return exit code 5 on timeout. `wait` does the same polling without
+clicking; `--gone` waits for disappearance.
 
 ## Words / run / schema (CLI)
 

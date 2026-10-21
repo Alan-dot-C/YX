@@ -91,5 +91,22 @@ $who = Invoke-Json $yx @('run', 'whoami')
 Assert-True ($who.ok -eq $true) 'yx run whoami failed'
 Assert-True ($who.stdout -match 'User Name') 'whoami output missing User Name'
 
+$sample = Join-Path $PSScriptRoot 'corpus\sample.png'
+
+Write-Host '11. find on a fixed image'
+$found = Invoke-Json $yx @('find', 'YX', '--image', $sample)
+Assert-True ($found.ok -eq $true) 'find failed'
+Assert-True ($found.count -ge 1) 'find returned no match'
+
+Write-Host '12. read around a match'
+$read = Invoke-Json $yx @('read', '--find', '123', '--image', $sample)
+Assert-True ($read.ok -eq $true) 'read failed'
+Assert-True ($read.text -match '123') 'read text missing 123'
+
+Write-Host '13. click-text dry-run'
+$click = Invoke-Json $yx @('click-text', 'YX', '--image', $sample, '--dry-run')
+Assert-True ($click.ok -eq $true) 'click-text dry-run failed'
+Assert-True ($click.clicked -eq $false) 'dry-run clicked anyway'
+
 Write-Host ''
 Write-Host 'ALL TESTS PASSED'

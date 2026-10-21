@@ -1,4 +1,4 @@
-# Known limitations (v0.3)
+# Known limitations (v0.4)
 
 This is a small, local tool. It is not a production security product.
 
@@ -44,6 +44,19 @@ This is a small, local tool. It is not a production security product.
   not always mean the command is broken.
 - There is no argument substitution. Words are fixed commands, not templates.
 
+## Task commands
+
+- `find` / `read` / `wait` read the current foreground screen. Focus the
+  target window first; they do not take a window handle yet.
+- `find` / `read` are OCR fuzzy. Numbers can be misread (`62.52` can come back
+  as `62 · 52`); always treat the text as a hint, not a typed value.
+- `read --find` returns lines by vertical proximity and column overlap, not by
+  semantic grouping. It can include a neighbouring label.
+- `click-text` can click the wrong target if the same text appears more than
+  once. Use `--index`, or `--dry-run` first and inspect the coordinates.
+- There is no undo. A click is a real mouse event.
+- `wait` polls the whole screen every 250 ms; there is no region filter yet.
+
 ## Platform
 
 - Windows 10/11 only.
@@ -54,7 +67,7 @@ This is a small, local tool. It is not a production security product.
 - Per-monitor DPI is set by YX/handeye at process start. A client that
   captures coordinates from another DPI context may need to scale them.
 
-## Not in v0.3
+## Not in v0.4
 
 - Text-file compression
 - AI-generated words and memory

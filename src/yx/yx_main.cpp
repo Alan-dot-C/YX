@@ -18,6 +18,7 @@
 #include "../sieve.h"
 #include "../uia.h"
 #include "../winenum.h"
+#include "../input.h"
 #include "../handeye_bridge.h"
 #include "../schema.h"
 #include "words.h"
@@ -39,7 +40,7 @@
 #include <winrt/base.h>
 #include <sddl.h>
 
-#define YX_VERSION L"0.3.0"
+#define YX_VERSION L"0.4.0"
 
 // ------------------------------ 名字与路径 ------------------------------
 
@@ -983,6 +984,314 @@ static bool RunHandeyeOpen(const Word& w, DWORD& exitCode, std::string& out,
     return true;
 }
 
+static std::wstring Compact(const std::wstring& s) {
+    std::wstring out;
+    for (wchar_t c : s) {
+        if (!iswspace(c)) out += (wchar_t)towlower(c);
+    }
+    return out;
+}
+
+static bool CaptureForTask(const std::wstring& image, OcrResult& r) {
+    if (!image.empty()) {
+        r = EyeRecognizeImageFile(image);
+        return r.ok;
+    }
+    OcrRequest req;
+    req.merge = true;
+    req.padPx = 8;
+    r = EyeRecognize(req);
+    return r.ok;
+}
+
+static int CmdFind(int argc, wchar_t** argv) {
+    std::wstring needle = (argc > 2 && argv[2][0] != L'-') ? argv[2] : GetOpt(argc, argv, L"--text");
+    if (needle.empty()) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"find").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"error", L"missing text");
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+    std::wstring image = GetOpt(argc, argv, L"--image");
+    std::wstring matches = L"[";
+    int count = 0;
+    std::wstring via;
+
+    if (image.empty() && UiInit()) {
+        auto nodes = UiFind(needle, 300, 400);
+        for (const auto& n : nodes) {
+            if (!n.enabled || n.offscreen || n.rect.w <= 0) continue;
+            if (count++) matches += L",";
+            matches += L"{\"text\":\"" + JsonStr(n.name) + L"\"";
+            matches += L",\"role\":\"" + JsonStr(n.role) + L"\"";
+            matches += L",\"x\":" + std::to_wstring(n.rect.x);
+            matches += L",\"y\":" + std::to_wstring(n.rect.y);
+            matches += L",\"w\":" + std::to_wstring(n.rect.w);
+            matches += L",\"h\":" + std::to_wstring(n.rect.h);
+            matches += L",\"score\":1.0,\"via\":\"ui\"}";
+            if (count >= 8) break;
+        }
+        if (count) via = L"ui";
+    }
+
+    if (count == 0) {
+        OcrResult r;
+        if (!CaptureForTask(image, r)) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"find").Bool(L"ok", false);
+            d.Int(L"rc", 3).Str(L"error", r.error.empty() ? L"capture failed" : r.error);
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 3;
+        }
+        auto hits = SieveFind(r.lines, needle, 8);
+        for (const auto& h : hits) {
+            if (count++) matches += L",";
+            matches += L"{\"text\":\"" + JsonStr(h.text) + L"\"";
+            matches += L",\"x\":" + std::to_wstring(h.box.x);
+            matches += L",\"y\":" + std::to_wstring(h.box.y);
+            matches += L",\"w\":" + std::to_wstring(h.box.w);
+            matches += L",\"h\":" + std::to_wstring(h.box.h);
+            wchar_t buf[32] = {};
+            swprintf_s(buf, L"%.3f", h.score);
+            matches += L",\"score\":" + std::wstring(buf) + L",\"via\":\"ocr\"}";
+        }
+        via = L"ocr";
+    }
+    matches += L"]";
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"find").Bool(L"ok", count > 0);
+    d.Str(L"text", needle).Str(L"via", via).Int(L"count", count);
+    d.Raw(L"matches", matches);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return count > 0 ? 0 : 1;
+}
+
+static int CmdRead(int argc, wchar_t** argv) {
+    std::wstring needle = GetOpt(argc, argv, L"--find");
+    std::wstring image = GetOpt(argc, argv, L"--image");
+    int context = _wtoi(GetOpt(argc, argv, L"--context").c_str());
+    if (context < 0) context = 0;
+    if (context == 0 && GetOpt(argc, argv, L"--context").empty()) context = 1;
+
+    OcrResult r;
+    if (!CaptureForTask(image, r)) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"read").Bool(L"ok", false);
+        d.Int(L"rc", 3).Str(L"error", r.error.empty() ? L"capture failed" : r.error);
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 3;
+    }
+
+    std::vector<size_t> idx;
+    if (needle.empty()) {
+        for (size_t i = 0; i < r.lines.size() && i < 60; ++i) idx.push_back(i);
+    } else {
+        std::wstring n = Compact(needle);
+        for (size_t i = 0; i < r.lines.size(); ++i) {
+            if (Compact(r.lines[i].text).find(n) != std::wstring::npos) idx.push_back(i);
+        }
+    }
+
+    std::set<size_t> take;
+    if (needle.empty()) {
+        for (size_t i : idx) take.insert(i);
+    } else {
+        for (size_t i : idx) {
+            const RectI& m = r.lines[i].box;
+            int top = m.y - m.h * (context + 2);
+            int bot = m.bottom() + m.h * (context + 2);
+            for (size_t j = 0; j < r.lines.size(); ++j) {
+                const RectI& b = r.lines[j].box;
+                int left = (std::max)(m.x, b.x);
+                int right = (std::min)(m.right(), b.right());
+                if (j == i || (b.cy() >= top && b.cy() <= bot && right > left)) {
+                    take.insert(j);
+                }
+            }
+        }
+    }
+
+    std::vector<size_t> ordered(take.begin(), take.end());
+    std::sort(ordered.begin(), ordered.end(), [&](size_t a, size_t b) {
+        if (r.lines[a].box.y != r.lines[b].box.y) return r.lines[a].box.y < r.lines[b].box.y;
+        return r.lines[a].box.x < r.lines[b].box.x;
+    });
+
+    std::wstring lines = L"[";
+    std::wstring text;
+    int count = 0;
+    for (size_t i : ordered) {
+        if (count++) lines += L",";
+        const OcrLine& l = r.lines[i];
+        lines += L"{\"text\":\"" + JsonStr(l.text) + L"\"";
+        lines += L",\"x\":" + std::to_wstring(l.box.x);
+        lines += L",\"y\":" + std::to_wstring(l.box.y);
+        lines += L",\"w\":" + std::to_wstring(l.box.w);
+        lines += L",\"h\":" + std::to_wstring(l.box.h) + L"}";
+        if (!text.empty()) text += L"\n";
+        text += l.text;
+    }
+    lines += L"]";
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"read").Bool(L"ok", count > 0);
+    d.Str(L"find", needle).Str(L"text", text).Int(L"count", count);
+    d.Raw(L"lines", lines);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return count > 0 ? 0 : 1;
+}
+
+static bool ScreenHasText(const std::wstring& needle) {
+    OcrRequest req;
+    req.merge = true;
+    OcrResult r = EyeRecognize(req);
+    return r.ok && !SieveFind(r.lines, needle, 1).empty();
+}
+
+static int VerifyExpect(const std::wstring& expectText, const std::wstring& expectGone, int timeoutMs) {
+    if (expectText.empty() && expectGone.empty()) return 0;
+    if (timeoutMs <= 0) timeoutMs = 3000;
+    DWORD start = GetTickCount();
+    for (;;) {
+        bool ok = true;
+        if (!expectText.empty()) ok = ok && ScreenHasText(expectText);
+        if (!expectGone.empty()) ok = ok && !ScreenHasText(expectGone);
+        if (ok) return 0;
+        if ((int)(GetTickCount() - start) > timeoutMs) return 5;
+        Sleep(250);
+    }
+}
+
+static int CmdClickText(int argc, wchar_t** argv) {
+    std::wstring needle = (argc > 2 && argv[2][0] != L'-') ? argv[2] : GetOpt(argc, argv, L"--text");
+    if (needle.empty()) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"click-text").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"error", L"missing text");
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+    int index = _wtoi(GetOpt(argc, argv, L"--index").c_str());
+    bool right = GetFlag(argc, argv, L"--right");
+    bool dry = GetFlag(argc, argv, L"--dry-run");
+    std::wstring image = GetOpt(argc, argv, L"--image");
+    std::wstring expectText = GetOpt(argc, argv, L"--expect");
+    std::wstring expectGone = GetOpt(argc, argv, L"--expect-gone");
+    int expectTimeout = _wtoi(GetOpt(argc, argv, L"--expect-timeout").c_str());
+
+    int x = 0, y = 0;
+    bool found = false;
+    std::wstring via;
+
+    if (image.empty() && UiInit()) {
+        auto nodes = UiFind(needle, 300, 400);
+        std::vector<UiNode> usable;
+        for (const auto& n : nodes) {
+            if (n.enabled && !n.offscreen && n.rect.w > 0) usable.push_back(n);
+        }
+        if (!usable.empty()) {
+            if (index < 0 || index >= (int)usable.size()) index = 0;
+            const UiNode& n = usable[index];
+            x = n.rect.cx();
+            y = n.rect.cy();
+            found = true;
+            via = L"ui";
+            if (!dry) {
+                InputInit();
+                if (!(n.invokable && UiInvoke(n))) {
+                    MoveTo(x, y, 200);
+                    Sleep(60);
+                    ClickNow(right);
+                }
+                InputShutdown();
+            }
+        }
+    }
+
+    if (!found) {
+        OcrResult r;
+        if (!CaptureForTask(image, r)) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"click-text").Bool(L"ok", false);
+            d.Int(L"rc", 3).Str(L"error", r.error.empty() ? L"capture failed" : r.error);
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 3;
+        }
+        auto hits = SieveFind(r.lines, needle, 8);
+        if (!hits.empty()) {
+            if (index < 0 || index >= (int)hits.size()) index = 0;
+            x = hits[index].box.cx();
+            y = hits[index].box.cy();
+            found = true;
+            via = L"ocr";
+            if (!dry && image.empty()) {
+                InputInit();
+                MoveTo(x, y, 200);
+                Sleep(60);
+                ClickNow(right);
+                InputShutdown();
+            }
+        }
+    }
+
+    if (!found) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"click-text").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"text", needle).Str(L"error", L"not found");
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+
+    int verifyRc = 0;
+    if (!dry) verifyRc = VerifyExpect(expectText, expectGone, expectTimeout);
+
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"click-text");
+    d.Bool(L"ok", verifyRc == 0).Str(L"text", needle).Str(L"via", via);
+    d.Int(L"x", x).Int(L"y", y).Bool(L"clicked", !dry);
+    if (verifyRc != 0) d.Int(L"rc", verifyRc).Str(L"error", L"expect failed");
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return verifyRc;
+}
+
+static int CmdWait(int argc, wchar_t** argv) {
+    std::wstring needle = (argc > 2 && argv[2][0] != L'-') ? argv[2] : GetOpt(argc, argv, L"--text");
+    if (needle.empty()) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"wait").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"error", L"missing text");
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+    bool gone = GetFlag(argc, argv, L"--gone");
+    int timeout = _wtoi(GetOpt(argc, argv, L"--timeout").c_str());
+    if (timeout <= 0) timeout = 5000;
+
+    DWORD start = GetTickCount();
+    for (;;) {
+        bool found = ScreenHasText(needle);
+        if (gone ? !found : found) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"wait").Bool(L"ok", true);
+            d.Str(L"text", needle).Bool(L"gone", gone);
+            d.Int(L"ms", (long long)(GetTickCount() - start));
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 0;
+        }
+        if ((int)(GetTickCount() - start) > timeout) {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"wait").Bool(L"ok", false);
+            d.Str(L"text", needle).Bool(L"gone", gone);
+            d.Int(L"rc", 4).Str(L"error", L"timeout");
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 4;
+        }
+        Sleep(250);
+    }
+}
+
 static int CmdWords(int argc, wchar_t** argv) {
     bool json = GetFlag(argc, argv, L"--json");
     const auto& words = AllWords();
@@ -1076,7 +1385,7 @@ static int CmdRun(int argc, wchar_t** argv) {
 static int CmdSchema() {
     std::wstring s = L"{\"v\":\"1\",\"tool\":\"yx\",\"version\":\"";
     s += YX_VERSION;
-    s += L"\",\"ops\":[\"status\",\"framing\",\"zoom\",\"words\",\"help\",\"run\",\"log.verify\"],";
+    s += L"\",\"ops\":[\"status\",\"framing\",\"zoom\",\"find\",\"read\",\"click-text\",\"wait\",\"words\",\"help\",\"run\",\"log.verify\"],";
     s += L"\"levels\":[\"L0\",\"L1\",\"L2\"],\"words\":";
     s += std::to_wstring(AllWords().size());
     s += L",\"organ\":[";
@@ -1102,6 +1411,10 @@ static void PrintUsage() {
     wprintf(L"  yx status                         问常驻进程要状态（没开就本地回一份）\n");
     wprintf(L"  yx framing [--level L0|L1|L2]     取一帧；默认 L0\n");
     wprintf(L"  yx zoom --ref <ref>               按 ref 回 L2，不重新截屏\n");
+    wprintf(L"  yx find <文字>                    找文字，返回坐标和分数\n");
+    wprintf(L"  yx read --find <文字>             只回命中行和后面几行\n");
+    wprintf(L"  yx click-text <文字>              找到就点，可加 --expect\n");
+    wprintf(L"  yx wait <文字> [--gone]           等文字出现/消失\n");
     wprintf(L"  yx words [--json]                 列出 Windows 命令词\n");
     wprintf(L"  yx help <词>                      看单个词的说明\n");
     wprintf(L"  yx run <词>                       执行一个词（打开设置页或跑诊断命令）\n");
@@ -1148,6 +1461,14 @@ int YxMain(int argc, wchar_t** argv) {
         rc = CmdFraming(argc, argv);
     } else if (cmd == L"zoom") {
         rc = CmdZoom(argc, argv);
+    } else if (cmd == L"find") {
+        rc = CmdFind(argc, argv);
+    } else if (cmd == L"read") {
+        rc = CmdRead(argc, argv);
+    } else if (cmd == L"click-text") {
+        rc = CmdClickText(argc, argv);
+    } else if (cmd == L"wait") {
+        rc = CmdWait(argc, argv);
     } else if (cmd == L"words") {
         rc = CmdWords(argc, argv);
     } else if (cmd == L"run") {

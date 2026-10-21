@@ -14,6 +14,10 @@
 
 - `yx framing --level L0|L1|L2`：取一帧，按级别给视图
 - `yx zoom --ref <ref>`：按引用回 L2，不重新截屏
+- `yx find <文字>`：找文字，返回坐标和分数
+- `yx read --find <文字>`：只回命中行和附近几行，适合读余额/错误/状态
+- `yx click-text <文字>`：找到就点，可加 `--expect` / `--expect-gone` 验结果
+- `yx wait <文字>`：等文字出现，`--gone` 等它消失
 - `yx status`：服务在不在、版本、管道、数据目录
 - `yx words` / `yx words --json`：列出 30+ 个常用 Windows 命令词
 - `yx help <词>`：看单个词做什么
@@ -34,6 +38,18 @@
 
 词表是人工审核过的，AI 只发词名，不拼命令、不做参数替换。
 危险命令（格式化、关机、分区、删注册表）故意不放。
+
+## 定点读和点文字
+
+```powershell
+.\yx.exe find 余额
+.\yx.exe read --find 余额          # 返回“充值余额”和下面的 ¥62.52
+.\yx.exe click-text 保存 --expect "已保存"
+.\yx.exe wait "完成" --timeout 10000
+```
+
+`find` 先走 UI Automation，认不出来再回 OCR；`read` 只回命中行和上下几行，
+不会把整屏塞回来。`click-text --dry-run` 只报目标坐标，不点。
 
 ## 跑起来
 
@@ -78,7 +94,7 @@
 ## 现在不做
 
 文本压缩、AI 自动生成词表、记忆、托盘、本地 HTTP、GPU OCR、账本的 HMAC/外部锚。
-这些以后再说，v0.3 先把“一个 exe、能看见、能点、能查、能用一句话开 Windows 功能”做稳。
+这些以后再说，v0.4 先把“一个 exe、能看见、能点、能查、能定点读”做稳。
 
 ## 一个程序，两层
 
