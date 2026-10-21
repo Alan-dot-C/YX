@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $root = Split-Path $PSScriptRoot -Parent
 $yx   = Join-Path $root 'yx.exe'
@@ -107,6 +107,17 @@ Write-Host '13. click-text dry-run'
 $click = Invoke-Json $yx @('click-text', 'YX', '--image', $sample, '--dry-run')
 Assert-True ($click.ok -eq $true) 'click-text dry-run failed'
 Assert-True ($click.clicked -eq $false) 'dry-run clicked anyway'
+
+Write-Host '14. Chinese alias resolution'
+$alias = Invoke-Json $yx @('help', '设备管理器')
+Assert-True ($alias.name -eq 'devmgmt') 'alias did not resolve to devmgmt'
+$user = Invoke-Json $yx @('run', '当前用户')
+Assert-True ($user.ok -eq $true) 'Chinese alias run failed'
+
+Write-Host '15. click text through click'
+$click2 = Invoke-Json $yx @('click', 'YX', '--image', $sample, '--dry-run')
+Assert-True ($click2.op -eq 'click-text') 'click did not route to click-text'
+Assert-True ($click2.clicked -eq $false) 'click dry-run clicked anyway'
 
 Write-Host ''
 Write-Host 'ALL TESTS PASSED'

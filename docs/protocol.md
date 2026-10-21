@@ -1,4 +1,4 @@
-# YX protocol (v0.5)
+# YX protocol (v0.6)
 
 Any AI client can use YX. There is no SDK and no vendor-specific dependency.
 
@@ -127,6 +127,24 @@ them.
 | 4 | ref expired or request timed out |
 | 5 | ledger verification failed |
 | 6 | server not running (client-side only) |
+
+## Input fuzzification (CLI)
+
+A word can be called by its exact name, an exact alias/description, or a unique
+substring:
+
+```powershell
+yx run 设备管理器      # devmgmt
+yx run 当前用户        # whoami
+yx open 设置           # settings
+yx click 保存          # click-text
+yx click 100 200       # coordinate click
+```
+
+`open` accepts a URI/path/executable directly; otherwise it resolves a word and
+opens its target. `click` with two numeric arguments is a coordinate click;
+anything else is routed to `click-text`. Ambiguous queries return a
+`candidates` array instead of guessing.
 
 ## Task commands (CLI)
 

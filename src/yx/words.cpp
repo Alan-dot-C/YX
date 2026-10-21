@@ -10,7 +10,7 @@
 
 static const Word kWords[] = {
     // 设置
-    { L"settings",  L"设置", L"Windows 设置首页",       WordKind::Open, L"ms-settings:", nullptr },
+    { L"settings",  L"设置", L"Windows 设置首页",       WordKind::Open, L"ms-settings:", nullptr, L"设置|设置页" },
     { L"display",   L"设置", L"显示设置",               WordKind::Open, L"ms-settings:display", nullptr },
     { L"sound",     L"设置", L"声音设置",               WordKind::Open, L"ms-settings:sound", nullptr },
     { L"network",   L"设置", L"网络状态",               WordKind::Open, L"ms-settings:network-status", nullptr },

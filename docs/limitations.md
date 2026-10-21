@@ -1,4 +1,4 @@
-# Known limitations (v0.5)
+# Known limitations (v0.6)
 
 This is a small, local tool. It is not a production security product.
 
@@ -44,6 +44,19 @@ This is a small, local tool. It is not a production security product.
   not always mean the command is broken.
 - There is no argument substitution. Words are fixed commands, not templates.
 
+## Input fuzzification
+
+- It is string matching, not language understanding: exact name, exact
+  alias/description, then unique substring. There is no model and no semantic
+  similarity.
+- Most Chinese queries work through the description; only a few words have an
+  explicit alias (for example `设置`).
+- `click` treats two integer arguments as coordinates; everything else becomes
+  `click-text`. `1e3` is not treated as a coordinate.
+- `open` treats anything with `:`, `/`, `\`, or an executable extension as a
+  direct target. Ambiguous word queries return candidates instead of guessing.
+- `wait` and `find` still read the current foreground screen.
+
 ## Repetition memory
 
 - Only `read` and `click-text` successes are recorded. Arbitrary shell
@@ -79,7 +92,7 @@ This is a small, local tool. It is not a production security product.
 - Per-monitor DPI is set by YX/handeye at process start. A client that
   captures coordinates from another DPI context may need to scale them.
 
-## Not in v0.5
+## Not in v0.6
 
 - Text-file compression
 - AI-generated words and memory

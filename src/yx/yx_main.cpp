@@ -40,7 +40,7 @@
 #include <winrt/base.h>
 #include <sddl.h>
 
-#define YX_VERSION L"0.5.0"
+#define YX_VERSION L"0.6.0"
 
 // ------------------------------ 名字与路径 ------------------------------
 
@@ -992,6 +992,38 @@ static std::wstring Compact(const std::wstring& s) {
     return out;
 }
 
+// 输入模糊化：先精确名字，再精确别名/描述，最后唯一子串。
+// 匹配不到或有歧义都返回 nullptr；matches 可选带回候选。
+static const Word* ResolveWord(const std::wstring& query,
+                               std::vector<const Word*>* matches = nullptr) {
+    std::wstring q = ToUpper(Trim(query));
+    if (q.empty()) return nullptr;
+
+    for (const auto& w : AllWords()) {
+        if (ToUpper(w.name) == q) return &w;
+    }
+    for (const auto& w : AllWords()) {
+        if (w.alias) {
+            for (const auto& a : Split(w.alias, L'|')) {
+                if (ToUpper(Trim(a)) == q) return &w;
+            }
+        }
+    }
+    for (const auto& w : AllWords()) {
+        if (ToUpper(w.desc) == q) return &w;
+    }
+
+    std::vector<const Word*> hits;
+    for (const auto& w : AllWords()) {
+        std::wstring hay = ToUpper(std::wstring(w.name) + L" " + w.desc +
+                                   (w.alias ? (L" " + std::wstring(w.alias)) : L""));
+        if (hay.find(q) != std::wstring::npos) hits.push_back(&w);
+    }
+    if (hits.size() == 1) return hits[0];
+    if (matches) *matches = hits;
+    return nullptr;
+}
+
 static bool CaptureForTask(const std::wstring& image, OcrResult& r) {
     if (!image.empty()) {
         r = EyeRecognizeImageFile(image);
@@ -1002,6 +1034,73 @@ static bool CaptureForTask(const std::wstring& image, OcrResult& r) {
     req.padPx = 8;
     r = EyeRecognize(req);
     return r.ok;
+}
+
+static int CmdOpenQuery(int argc, wchar_t** argv) {
+    std::wstring query = (argc > 2 && argv[2][0] != L'-') ? argv[2] : GetOpt(argc, argv, L"--target");
+    if (query.empty()) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"open").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"error", L"missing target");
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+
+    auto direct = [&] {
+        if (query.find(L':') != std::wstring::npos) return true;
+        if (query.find(L'\\') != std::wstring::npos || query.find(L'/') != std::wstring::npos) return true;
+        std::wstring low = ToUpper(query);
+        for (const wchar_t* ext : { L".EXE", L".MSC", L".CPL", L".BAT", L".COM" }) {
+            if (low.size() >= wcslen(ext) && low.compare(low.size() - wcslen(ext), wcslen(ext), ext) == 0)
+                return true;
+        }
+        return false;
+    };
+
+    if (direct()) {
+        int rc = HandeyeOpen(query, L"");
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"open").Bool(L"ok", rc == 0);
+        d.Str(L"target", query);
+        if (rc != 0) d.Int(L"rc", rc);
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return rc;
+    }
+
+    std::vector<const Word*> cands;
+    const Word* w = ResolveWord(query, &cands);
+    if (!w) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"open").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"error", cands.empty() ? (L"unknown: " + query)
+                                                     : (L"ambiguous: " + query));
+        if (!cands.empty()) {
+            std::wstring s = L"[";
+            for (size_t i = 0; i < cands.size(); ++i) {
+                if (i) s += L",";
+                s += L"\"" + JsonStr(cands[i]->name) + L"\"";
+            }
+            s += L"]";
+            d.Raw(L"candidates", s);
+        }
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+    if (w->kind != WordKind::Open) {
+        JsonDoc d;
+        d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"open").Bool(L"ok", false);
+        d.Int(L"rc", 1).Str(L"error", std::wstring(L"use: yx run ") + w->name);
+        wprintf(L"%ls\n", d.Emit().c_str());
+        return 1;
+    }
+
+    int rc = HandeyeOpen(w->target, w->args ? w->args : L"");
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"open").Bool(L"ok", rc == 0);
+    d.Str(L"query", query).Str(L"name", w->name).Str(L"target", w->target);
+    if (rc != 0) d.Int(L"rc", rc);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return rc;
 }
 
 // ------------------------------ 重复记忆 ------------------------------
@@ -1619,7 +1718,8 @@ static int CmdWords(int argc, wchar_t** argv) {
 
 static int CmdWordHelp(int argc, wchar_t** argv) {
     std::wstring name = argc > 2 ? argv[2] : GetOpt(argc, argv, L"--word");
-    const Word* w = FindWord(name);
+    std::vector<const Word*> cands;
+    const Word* w = ResolveWord(name, &cands);
     if (!w) {
         const UserWord* u = FindUserWord(name);
         if (u) {
@@ -1633,7 +1733,17 @@ static int CmdWordHelp(int argc, wchar_t** argv) {
         }
         JsonDoc d;
         d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"help").Bool(L"ok", false);
-        d.Int(L"rc", 1).Str(L"error", L"unknown word: " + name);
+        d.Int(L"rc", 1).Str(L"error", cands.empty() ? (L"unknown word: " + name)
+                                                     : (L"ambiguous: " + name));
+        if (!cands.empty()) {
+            std::wstring s = L"[";
+            for (size_t i = 0; i < cands.size(); ++i) {
+                if (i) s += L",";
+                s += L"\"" + JsonStr(cands[i]->name) + L"\"";
+            }
+            s += L"]";
+            d.Raw(L"candidates", s);
+        }
         wprintf(L"%ls\n", d.Emit().c_str());
         return 1;
     }
@@ -1648,7 +1758,8 @@ static int CmdWordHelp(int argc, wchar_t** argv) {
 
 static int CmdRun(int argc, wchar_t** argv) {
     std::wstring name = argc > 2 ? argv[2] : GetOpt(argc, argv, L"--word");
-    const Word* w = FindWord(name);
+    std::vector<const Word*> cands;
+    const Word* w = ResolveWord(name, &cands);
     if (!w) {
         const UserWord* u = FindUserWord(name);
         if (u) {
@@ -1679,7 +1790,17 @@ static int CmdRun(int argc, wchar_t** argv) {
         }
         JsonDoc d;
         d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"run").Bool(L"ok", false);
-        d.Int(L"rc", 1).Str(L"error", L"unknown word: " + name);
+        d.Int(L"rc", 1).Str(L"error", cands.empty() ? (L"unknown word: " + name)
+                                                     : (L"ambiguous: " + name));
+        if (!cands.empty()) {
+            std::wstring s = L"[";
+            for (size_t i = 0; i < cands.size(); ++i) {
+                if (i) s += L",";
+                s += L"\"" + JsonStr(cands[i]->name) + L"\"";
+            }
+            s += L"]";
+            d.Raw(L"candidates", s);
+        }
         wprintf(L"%ls\n", d.Emit().c_str());
         return 1;
     }
@@ -1718,7 +1839,7 @@ static int CmdRun(int argc, wchar_t** argv) {
 static int CmdSchema() {
     std::wstring s = L"{\"v\":\"1\",\"tool\":\"yx\",\"version\":\"";
     s += YX_VERSION;
-    s += L"\",\"ops\":[\"status\",\"framing\",\"zoom\",\"find\",\"read\",\"click-text\",\"wait\",\"words\",\"words.pending\",\"words.accept\",\"words.reject\",\"help\",\"run\",\"log.verify\"],";
+    s += L"\",\"ops\":[\"status\",\"framing\",\"zoom\",\"open\",\"find\",\"read\",\"click-text\",\"wait\",\"words\",\"words.pending\",\"words.accept\",\"words.reject\",\"help\",\"run\",\"log.verify\"],";
     s += L"\"levels\":[\"L0\",\"L1\",\"L2\"],\"words\":";
     s += std::to_wstring(AllWords().size() + LoadUserWords().size());
     s += L",\"organ\":[";
@@ -1744,6 +1865,7 @@ static void PrintUsage() {
     wprintf(L"  yx status                         问常驻进程要状态（没开就本地回一份）\n");
     wprintf(L"  yx framing [--level L0|L1|L2]     取一帧；默认 L0\n");
     wprintf(L"  yx zoom --ref <ref>               按 ref 回 L2，不重新截屏\n");
+    wprintf(L"  yx open <中文名|URL>              打开设置/工具；URL 直接打开\n");
     wprintf(L"  yx find <文字>                    找文字，返回坐标和分数\n");
     wprintf(L"  yx read --find <文字>             只回命中行和后面几行\n");
     wprintf(L"  yx click-text <文字>              找到就点，可加 --expect\n");
@@ -1796,6 +1918,8 @@ int YxMain(int argc, wchar_t** argv) {
         rc = CmdFraming(argc, argv);
     } else if (cmd == L"zoom") {
         rc = CmdZoom(argc, argv);
+    } else if (cmd == L"open") {
+        rc = CmdOpenQuery(argc, argv);
     } else if (cmd == L"find") {
         rc = CmdFind(argc, argv);
     } else if (cmd == L"read") {

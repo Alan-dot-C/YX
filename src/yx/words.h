@@ -15,6 +15,7 @@ struct Word {
     WordKind       kind;
     const wchar_t* target;
     const wchar_t* args;    // only for Open; may be nullptr
+    const wchar_t* alias;   // '|' separated; may be nullptr
 };
 
 const std::vector<Word>& AllWords();

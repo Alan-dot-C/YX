@@ -95,10 +95,13 @@ public projection contract.
 - The organ layer (`handeye 1.2`) is trimmed to raw collection and execution,
   and is now linked into the same `yx.exe` binary. `handeye.bat` forwards old
   command names for compatibility.
-- `yx 0.5` has `serve`, `status`, `framing` (L0/L1/L2), `zoom`, `find`,
-  `read`, `click-text`, `wait`, `log verify` (FNV-1a chain plus a
+- `yx 0.6` has `serve`, `status`, `framing` (L0/L1/L2), `zoom`, `open`,
+  `find`, `read`, `click-text`, `wait`, `log verify` (FNV-1a chain plus a
   `logs\head` anchor), and a curated `words` table with
   `words` / `help` / `run` / `schema`.
+- Input fuzzification resolves a word by exact name, exact alias/description,
+  then unique substring. `click <text>` routes to `click-text`; two numeric
+  arguments still mean a coordinate click.
 - Repetition memory is a first attempt: `read` / `click-text` are recorded by
   fingerprint; after five successes a proposal is written; a human can
   `words accept` or `words reject`, and accepted words live in
