@@ -18,6 +18,8 @@
 #include "../sieve.h"
 #include "../uia.h"
 #include "../winenum.h"
+#include "../handeye_bridge.h"
+#include "../schema.h"
 #include "words.h"
 
 #include <cstdio>
@@ -37,7 +39,7 @@
 #include <winrt/base.h>
 #include <sddl.h>
 
-#define YX_VERSION L"0.2.0"
+#define YX_VERSION L"0.3.0"
 
 // ------------------------------ 名字与路径 ------------------------------
 
@@ -972,10 +974,13 @@ static bool RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs,
 
 static bool RunHandeyeOpen(const Word& w, DWORD& exitCode, std::string& out,
                            std::string& err, bool& timedOut, bool& truncated) {
-    std::wstring exe = ExeDir() + L"\\handeye.exe";
-    std::wstring cmd = L"\"" + exe + L"\" open \"" + w.target + L"\"";
-    if (w.args && w.args[0]) cmd += L" --args \"" + std::wstring(w.args) + L"\"";
-    return RunProcessCapture(cmd, 15000, out, err, exitCode, timedOut, truncated);
+    out.clear();
+    err.clear();
+    timedOut = false;
+    truncated = false;
+    std::wstring extra = (w.args && w.args[0]) ? std::wstring(w.args) : L"";
+    exitCode = (DWORD)HandeyeOpen(w.target, extra);
+    return true;
 }
 
 static int CmdWords(int argc, wchar_t** argv) {
@@ -1074,7 +1079,15 @@ static int CmdSchema() {
     s += L"\",\"ops\":[\"status\",\"framing\",\"zoom\",\"words\",\"help\",\"run\",\"log.verify\"],";
     s += L"\"levels\":[\"L0\",\"L1\",\"L2\"],\"words\":";
     s += std::to_wstring(AllWords().size());
-    s += L",\"exit_codes\":{\"0\":\"ok\",\"1\":\"bad argument\",\"3\":\"capture/exec failed\",";
+    s += L",\"organ\":[";
+    bool first = true;
+    for (const auto& c : CommandSpecs()) {
+        if (!first) s += L",";
+        first = false;
+        s += L"\"" + std::wstring(c.name) + L"\"";
+    }
+    s += L"],";
+    s += L"\"exit_codes\":{\"0\":\"ok\",\"1\":\"bad argument\",\"3\":\"capture/exec failed\",";
     s += L"\"4\":\"timeout or expired ref\",\"5\":\"ledger verify failed\",\"6\":\"server not running\"}}";
     wprintf(L"%ls\n", s.c_str());
     return 0;
@@ -1093,13 +1106,14 @@ static void PrintUsage() {
     wprintf(L"  yx help <词>                      看单个词的说明\n");
     wprintf(L"  yx run <词>                       执行一个词（打开设置页或跑诊断命令）\n");
     wprintf(L"  yx schema                         给 AI 的能力清单（JSON）\n");
+    wprintf(L"  yx capture / ocr / uia / click    器官命令（旧 handeye 命令也走这里）\n");
     wprintf(L"  yx log verify [--dir <目录>]      校验账本哈希链和 head 锚\n");
     wprintf(L"  yx help                           这份帮助\n\n");
     wprintf(L"管道协议：u32 长度前缀 + UTF-8 JSON\n");
     wprintf(L"退出码：0 成功 / 1 参数错误 / 3 采集失败 / 4 ref 过期 / 5 校验失败 / 6 服务未就绪\n");
 }
 
-int wmain(int argc, wchar_t** argv) {
+int YxMain(int argc, wchar_t** argv) {
     InitConsoleUtf8();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 

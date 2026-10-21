@@ -18,6 +18,7 @@
 #include "schema.h"
 #include "uia.h"
 #include "clip.h"
+#include "handeye_bridge.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -289,24 +290,29 @@ static int CmdClipboard() {
     return ok ? 0 : 3;
 }
 
+int HandeyeOpen(const std::wstring& target, const std::wstring& args) {
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", target.c_str(),
+                                args.empty() ? nullptr : args.c_str(),
+                                nullptr, SW_SHOWNORMAL);
+    return (INT_PTR)r > 32 ? 0 : 3;
+}
+
 static int CmdOpen(const ArgList& args) {
     auto pos = args.Positional();
     if (pos.size() < 2) return FailJson(L"open", L"usage: open <target> [--args ...]", 1);
     std::wstring target = pos[1];
     std::wstring extra = args.Get(L"--args");
 
-    HINSTANCE r = ShellExecuteW(nullptr, L"open", target.c_str(),
-                                extra.empty() ? nullptr : extra.c_str(),
-                                nullptr, SW_SHOWNORMAL);
-    bool ok = (INT_PTR)r > 32;
+    int rc = HandeyeOpen(target, extra);
+    bool ok = (rc == 0);
 
     JsonDoc d;
     d.Str(L"v", L"1").Str(L"tool", L"handeye").Str(L"op", L"open").Bool(L"ok", ok);
     d.Str(L"target", target);
     if (!extra.empty()) d.Str(L"args", extra);
-    if (!ok) d.Int(L"rc", 3);
+    if (!ok) d.Int(L"rc", rc);
     wprintf(L"%ls\n", d.Emit().c_str());
-    return ok ? 0 : 3;
+    return rc;
 }
 
 // ------------------------------ 能力自述 ------------------------------
@@ -319,7 +325,7 @@ static void PrintSchema() { PrintSchemaFromTable(); }
 
 static void PrintUsage() { PrintUsageFromTable(); }
 
-int wmain(int argc, wchar_t** argv) {
+int HandeyeMain(int argc, wchar_t** argv) {
     InitConsoleUtf8();
 
     // DPI：用 PerMonitorV2，多显示器下坐标才正确

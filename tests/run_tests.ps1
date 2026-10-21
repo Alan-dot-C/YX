@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path $PSScriptRoot -Parent
 $yx   = Join-Path $root 'yx.exe'
-$he   = Join-Path $root 'handeye.exe'
+$bat  = Join-Path $root 'handeye.bat'
 
 function Assert-True([bool]$condition, [string]$message) {
     if (-not $condition) { throw "FAIL: $message" }
@@ -16,7 +16,7 @@ function Invoke-Json([string]$exe, [string[]]$arguments) {
 
 Write-Host '1. binaries'
 Assert-True (Test-Path $yx) 'yx.exe missing; run build.ps1 first'
-Assert-True (Test-Path $he) 'handeye.exe missing; run build.ps1 first'
+Assert-True (Test-Path $bat) 'handeye.bat compatibility shim missing'
 
 Write-Host '2. status'
 $status = Invoke-Json $yx @('status')
@@ -70,9 +70,13 @@ finally {
     }
 }
 
-Write-Host '8. handeye raw cursor'
-$cursor = Invoke-Json $he @('cursor')
-Assert-True ($cursor.ok -eq $true) 'handeye cursor failed'
+Write-Host '8. organ command inside yx'
+$cursor = Invoke-Json $yx @('cursor')
+Assert-True ($cursor.ok -eq $true) 'yx cursor failed'
+
+Write-Host '8b. handeye.bat compatibility'
+$cursor2 = Invoke-Json $bat @('cursor')
+Assert-True ($cursor2.ok -eq $true) 'handeye.bat cursor failed'
 
 Write-Host '9. words table'
 $words = Invoke-Json $yx @('words', '--json')

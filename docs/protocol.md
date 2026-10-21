@@ -1,4 +1,4 @@
-# YX protocol (v0.2)
+# YX protocol (v0.3)
 
 Any AI client can use YX. There is no SDK and no vendor-specific dependency.
 
@@ -182,5 +182,5 @@ On the first mismatch it returns exit code **5** and fills `file`, `line`,
 
 - The protocol is intentionally small. Additions must be backward compatible:
   new fields are fine; changing the meaning of existing fields is not.
-- `handeye` is not part of this protocol. It is the organ layer: raw capture
-  and low-level actions. YX calls it when an action is needed.
+- The organ layer is inside the same `yx.exe`; `yx capture/ocr/...` are CLI
+  commands, not pipe operations. `handeye.bat` forwards old command names.

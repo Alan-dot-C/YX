@@ -1,4 +1,4 @@
-# Known limitations (v0.2)
+# Known limitations (v0.3)
 
 This is a small, local tool. It is not a production security product.
 
@@ -54,7 +54,7 @@ This is a small, local tool. It is not a production security product.
 - Per-monitor DPI is set by YX/handeye at process start. A client that
   captures coordinates from another DPI context may need to scale them.
 
-## Not in v0.2
+## Not in v0.3
 
 - Text-file compression
 - AI-generated words and memory
