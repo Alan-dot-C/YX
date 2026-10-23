@@ -42,7 +42,7 @@
 #include <winrt/base.h>
 #include <sddl.h>
 
-#define YX_VERSION L"0.7.0"
+#define YX_VERSION L"1.0.0"
 
 // ------------------------------ 名字与路径 ------------------------------
 

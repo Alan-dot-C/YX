@@ -1,4 +1,4 @@
-# YX protocol (v0.7)
+# YX protocol (v1.0)
 
 Any AI client can use YX. There is no SDK and no vendor-specific dependency.
 

@@ -1,4 +1,4 @@
-# Known limitations (v0.7)
+# Known limitations (v1.0)
 
 This is a small, local tool. It is not a production security product.
 

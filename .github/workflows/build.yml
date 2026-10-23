@@ -1,0 +1,21 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build yx.exe
+        shell: powershell
+        run: .\build.ps1
+
+      - name: Upload yx.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: yx-windows
+          path: yx.exe

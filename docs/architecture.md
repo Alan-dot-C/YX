@@ -95,7 +95,7 @@ public projection contract.
 - The organ layer (`handeye 1.2`) is trimmed to raw collection and execution,
   and is now linked into the same `yx.exe` binary. `handeye.bat` forwards old
   command names for compatibility.
-- `yx 0.7` has `serve`, `status`, `framing` (L0/L1/L2), `zoom`, `open`,
+- `yx 1.0` has `serve`, `status`, `framing` (L0/L1/L2), `zoom`, `open`,
   `find`, `read`, `click-text`, `wait`, `log verify` (FNV-1a chain plus a
   `logs\head` anchor), and a curated `words` table with
   `words` / `help` / `run` / `schema`.
