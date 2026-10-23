@@ -1,4 +1,4 @@
-# YX protocol (v0.6)
+# YX protocol (v0.7)
 
 Any AI client can use YX. There is no SDK and no vendor-specific dependency.
 
@@ -127,6 +127,20 @@ them.
 | 4 | ref expired or request timed out |
 | 5 | ledger verification failed |
 | 6 | server not running (client-side only) |
+
+## Fast mode (CLI)
+
+`find`, `read`, `click-text`, `wait`, and `framing` accept `--fast`:
+single-pass Chinese OCR (`scale=1`, no English second pass) and, for
+`find`/`click-text`/`framing`, no UI Automation.
+
+`find`, `read`, `click-text`, `wait` accept `--region x,y,w,h`; `wait`
+also accepts `--interval <ms>` (default 500). `framing --fast` reports
+`fast`, `ocr_ms`, `uia_ms`, `sieve_ms`; task commands report `fast`,
+`ms`.
+
+`--fast` trades English/number accuracy for latency. `--region` ignores
+text outside the rectangle. Both are opt-in; the default path is unchanged.
 
 ## Input fuzzification (CLI)
 

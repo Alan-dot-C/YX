@@ -33,6 +33,8 @@
 #include <vector>
 #include <mutex>
 #include <thread>
+#include <memory>
+#include <atomic>
 #include <atomic>
 #include <condition_variable>
 #include <cwctype>
@@ -40,7 +42,7 @@
 #include <winrt/base.h>
 #include <sddl.h>
 
-#define YX_VERSION L"0.6.0"
+#define YX_VERSION L"0.7.0"
 
 // ------------------------------ 名字与路径 ------------------------------
 
@@ -73,9 +75,14 @@ struct Job {
     std::wstring req;
     std::wstring resp;
     HANDLE       ev = nullptr;
+    std::atomic<bool> cancelled{ false };
+
+    ~Job() {
+        if (ev) CloseHandle(ev);
+    }
 };
 
-static std::deque<Job*>        g_q;
+static std::deque<std::shared_ptr<Job>> g_q;
 static std::mutex              g_qm;
 static std::condition_variable g_qcv;
 static std::atomic<bool>       g_serving{ true };
@@ -119,6 +126,10 @@ struct CachedFrame {
     OcrResult    ocr;
     SieveResult  sieve;
     std::vector<UiNode> ui;
+    bool         fast = false;
+    DWORD        ocrMs = 0;
+    DWORD        uiaMs = 0;
+    DWORD        sieveMs = 0;
 };
 
 static std::map<std::wstring, CachedFrame> g_frames;
@@ -206,25 +217,34 @@ static std::wstring Truncate(const std::wstring& s, size_t n) {
     return s.substr(0, n) + L"…";
 }
 
-static CachedFrame CaptureFrame() {
+static CachedFrame CaptureFrame(bool fast = false) {
     CachedFrame f;
     f.ref = NextRef();
     f.at = GetTickCount();
+    f.fast = fast;
 
     OcrRequest req;
-    req.merge = true;
+    req.scale = fast ? 1 : 0;
+    req.merge = !fast;
+    req.lang = fast ? L"zh" : L"auto";
     req.padPx = 8;
+    DWORD t0 = GetTickCount();
     f.ocr = EyeRecognize(req);
+    f.ocrMs = GetTickCount() - t0;
 
+    t0 = GetTickCount();
     SieveOptions so;
     so.keepAll = true;       // 报警抽取必须在裁剪前完成
     so.doDelta = false;      // 变化由我们自己按 key 计算
     so.maxLines = 100000;
     so.maxLineChars = 100000;
     f.sieve = SieveRun(f.ocr.lines, so);
+    f.sieveMs = GetTickCount() - t0;
 
-    if (UiInit()) {
+    if (!fast && UiInit()) {
+        t0 = GetTickCount();
         f.ui = UiTree(nullptr, 8, 600, 400);
+        f.uiaMs = GetTickCount() - t0;
     }
     return f;
 }
@@ -428,6 +448,10 @@ static std::wstring FrameResponse(const std::wstring& id, const std::wstring& op
     d.Raw(L"alarms", AlarmsJson(alarms));
     d.Int(L"line_count", (long long)f.ocr.lines.size());
     d.Int(L"ui_nodes", (long long)f.ui.size());
+    d.Bool(L"fast", f.fast);
+    d.Int(L"ocr_ms", (long long)f.ocrMs);
+    d.Int(L"uia_ms", (long long)f.uiaMs);
+    d.Int(L"sieve_ms", (long long)f.sieveMs);
     d.Int(L"ms", (long long)ms);
 
     if (level == L"L2") {
@@ -471,7 +495,8 @@ static std::wstring HandleOp(const std::wstring& req) {
         }
 
         DWORD t0 = GetTickCount();
-        CachedFrame f = CaptureFrame();
+        bool fast = JsonField(req, L"fast") == L"true";
+        CachedFrame f = CaptureFrame(fast);
         if (!f.ocr.ok) {
             return ErrorResponse(id, op, 3, f.ocr.error.empty() ? L"capture failed" : f.ocr.error);
         }
@@ -523,7 +548,7 @@ static void WorkerLoop() {
     }
 
     for (;;) {
-        Job* j = nullptr;
+        std::shared_ptr<Job> j;
         {
             std::unique_lock<std::mutex> lk(g_qm);
             g_qcv.wait(lk, [] { return !g_q.empty() || !g_serving.load(); });
@@ -532,8 +557,9 @@ static void WorkerLoop() {
             g_q.pop_front();
         }
         // worker 是唯一执行者：这里出问题只影响这一个请求，不能让线程死掉
+        if (j->cancelled.load()) continue;
         j->resp = HandleOp(j->req);
-        SetEvent(j->ev);
+        if (!j->cancelled.load()) SetEvent(j->ev);
     }
 }
 
@@ -572,23 +598,26 @@ static void ServeConn(HANDLE h) {
         std::string body(len, '\0');
         if (!ReadExact(h, body.data(), len)) break;
 
-        Job* j = new Job();
-        j->req = FromUtf8(body);
-        j->ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!j->ev) { delete j; break; }
+        auto job = std::make_shared<Job>();
+        job->req = FromUtf8(body);
+        job->ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!job->ev) break;
 
         {
             std::lock_guard<std::mutex> lk(g_qm);
-            g_q.push_back(j);
+            g_q.push_back(job);
         }
         g_qcv.notify_one();
 
         std::wstring resp;
-        DWORD w = WaitForSingleObject(j->ev, 15000);
-        if (w == WAIT_OBJECT_0) resp = j->resp;
-        else resp = L"{\"v\":1,\"ok\":false,\"rc\":4,\"error\":\"worker-timeout\"}";
-        CloseHandle(j->ev);
-        delete j;
+        DWORD w = WaitForSingleObject(job->ev, 15000);
+        if (w == WAIT_OBJECT_0) {
+            resp = job->resp;
+        } else {
+            // 只标记取消，不关事件、不 delete：worker 可能还在用这个 Job。
+            job->cancelled.store(true);
+            resp = L"{\"v\":1,\"ok\":false,\"rc\":4,\"error\":\"worker-timeout\"}";
+        }
 
         std::string out = ToUtf8(resp);
         uint32_t n = (uint32_t)out.size();
@@ -738,12 +767,16 @@ static std::wstring GetOpt(int argc, wchar_t** argv, const wchar_t* name) {
 static int CmdFraming(int argc, wchar_t** argv) {
     std::wstring key = GetOpt(argc, argv, L"--key");
     std::wstring level = GetOpt(argc, argv, L"--level");
+    bool fast = false;
+    for (int i = 2; i < argc; ++i) {
+        if (_wcsicmp(argv[i], L"--fast") == 0) fast = true;
+    }
     if (key.empty()) key = L"default";
     if (level.empty()) level = L"auto";
 
     std::wstring req = L"{\"v\":1,\"op\":\"framing\",\"id\":\"cli\",\"key\":\"" +
                        JsonStr(key) + L"\",\"target\":\"screen\",\"level\":\"" +
-                       JsonStr(level) + L"\"}";
+                       JsonStr(level) + L"\",\"fast\":" + (fast ? L"true" : L"false") + L"}";
     std::wstring resp;
     if (CallServer(req, resp, 50)) {
         wprintf(L"%ls\n", resp.c_str());
@@ -752,7 +785,7 @@ static int CmdFraming(int argc, wchar_t** argv) {
 
     // fail-open：服务不在，本地采集并投影，只是没有跨调用状态。
     DWORD t0 = GetTickCount();
-    CachedFrame f = CaptureFrame();
+    CachedFrame f = CaptureFrame(fast);
     if (!f.ocr.ok) {
         JsonDoc d;
         d.Str(L"v", L"1").Str(L"id", L"cli").Bool(L"ok", false).Str(L"op", L"framing");
@@ -1024,13 +1057,85 @@ static const Word* ResolveWord(const std::wstring& query,
     return nullptr;
 }
 
-static bool CaptureForTask(const std::wstring& image, OcrResult& r) {
+struct TaskOptions {
+    RectI region{};
+    bool  hasRegion = false;
+    bool  fast = false;
+    int   interval = 500;
+};
+
+static bool ParseRegion(const std::wstring& text, RectI& r, std::wstring& err) {
+    auto p = Split(text, L',');
+    if (p.size() != 4) {
+        err = L"--region needs x,y,w,h";
+        return false;
+    }
+    int v[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        std::wstring s = Trim(p[i]);
+        wchar_t* end = nullptr;
+        long n = wcstol(s.c_str(), &end, 10);
+        if (s.empty() || !end || *end != 0) {
+            err = L"--region values must be integers";
+            return false;
+        }
+        v[i] = (int)n;
+    }
+    if (v[2] <= 0 || v[3] <= 0) {
+        err = L"--region width/height must be positive";
+        return false;
+    }
+
+    RectI scr = EyeScreenRect();
+    if (scr.w > 0 && scr.h > 0) {
+        int left = (std::max)(0, v[0]);
+        int top = (std::max)(0, v[1]);
+        int right = (std::min)(scr.w, v[0] + v[2]);
+        int bottom = (std::min)(scr.h, v[1] + v[3]);
+        if (right <= left || bottom <= top) {
+            err = L"--region is outside the screen";
+            return false;
+        }
+        v[0] = left;
+        v[1] = top;
+        v[2] = right - left;
+        v[3] = bottom - top;
+    }
+
+    r = RectI{ v[0], v[1], v[2], v[3] };
+    return true;
+}
+
+static bool ParseTaskOptions(int argc, wchar_t** argv, TaskOptions& o, std::wstring& err) {
+    std::wstring region = GetOpt(argc, argv, L"--region");
+    if (!region.empty()) {
+        if (!ParseRegion(region, o.region, err)) return false;
+        o.hasRegion = true;
+    }
+    o.fast = GetFlag(argc, argv, L"--fast");
+    int interval = _wtoi(GetOpt(argc, argv, L"--interval").c_str());
+    if (interval >= 100) o.interval = interval;
+    return true;
+}
+
+static int TaskOptionError(const wchar_t* op, const std::wstring& msg) {
+    JsonDoc d;
+    d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", op).Bool(L"ok", false);
+    d.Int(L"rc", 1).Str(L"error", msg);
+    wprintf(L"%ls\n", d.Emit().c_str());
+    return 1;
+}
+
+static bool CaptureForTask(const std::wstring& image, const TaskOptions& opts, OcrResult& r) {
     if (!image.empty()) {
         r = EyeRecognizeImageFile(image);
         return r.ok;
     }
     OcrRequest req;
-    req.merge = true;
+    req.region = opts.hasRegion ? opts.region : RectI{};
+    req.scale = opts.fast ? 1 : 0;
+    req.merge = !opts.fast;
+    req.lang = opts.fast ? L"zh" : L"auto";
     req.padPx = 8;
     r = EyeRecognize(req);
     return r.ok;
@@ -1203,6 +1308,10 @@ static std::wstring RecordRepeat(const std::wstring& action, const std::wstring&
                                  const std::wstring& image) {
     if (arg.empty()) return L"";
 
+    wchar_t noLearn[8] = {};
+    DWORD n = GetEnvironmentVariableW(L"YX_NO_LEARN", noLearn, 8);
+    if (n > 0 && noLearn[0] != L'0') return L"";
+
     HANDLE m = CreateMutexW(nullptr, FALSE, L"Local\\yx_repeat_mutex");
     if (m) WaitForSingleObject(m, 2000);
 
@@ -1298,12 +1407,17 @@ static int CmdFind(int argc, wchar_t** argv) {
         wprintf(L"%ls\n", d.Emit().c_str());
         return 1;
     }
+    TaskOptions opts;
+    std::wstring optErr;
+    if (!ParseTaskOptions(argc, argv, opts, optErr)) return TaskOptionError(L"find", optErr);
+
+    DWORD t0 = GetTickCount();
     std::wstring image = GetOpt(argc, argv, L"--image");
     std::wstring matches = L"[";
     int count = 0;
     std::wstring via;
 
-    if (image.empty() && UiInit()) {
+    if (image.empty() && !opts.fast && !opts.hasRegion && UiInit()) {
         auto nodes = UiFind(needle, 300, 400);
         for (const auto& n : nodes) {
             if (!n.enabled || n.offscreen || n.rect.w <= 0) continue;
@@ -1322,7 +1436,7 @@ static int CmdFind(int argc, wchar_t** argv) {
 
     if (count == 0) {
         OcrResult r;
-        if (!CaptureForTask(image, r)) {
+        if (!CaptureForTask(image, opts, r)) {
             JsonDoc d;
             d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"find").Bool(L"ok", false);
             d.Int(L"rc", 3).Str(L"error", r.error.empty() ? L"capture failed" : r.error);
@@ -1348,6 +1462,7 @@ static int CmdFind(int argc, wchar_t** argv) {
     JsonDoc d;
     d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"find").Bool(L"ok", count > 0);
     d.Str(L"text", needle).Str(L"via", via).Int(L"count", count);
+    d.Bool(L"fast", opts.fast).Int(L"ms", (long long)(GetTickCount() - t0));
     d.Raw(L"matches", matches);
     wprintf(L"%ls\n", d.Emit().c_str());
     return count > 0 ? 0 : 1;
@@ -1356,12 +1471,17 @@ static int CmdFind(int argc, wchar_t** argv) {
 static int CmdRead(int argc, wchar_t** argv) {
     std::wstring needle = GetOpt(argc, argv, L"--find");
     std::wstring image = GetOpt(argc, argv, L"--image");
+    TaskOptions opts;
+    std::wstring optErr;
+    if (!ParseTaskOptions(argc, argv, opts, optErr)) return TaskOptionError(L"read", optErr);
+
+    DWORD t0 = GetTickCount();
     int context = _wtoi(GetOpt(argc, argv, L"--context").c_str());
     if (context < 0) context = 0;
     if (context == 0 && GetOpt(argc, argv, L"--context").empty()) context = 1;
 
     OcrResult r;
-    if (!CaptureForTask(image, r)) {
+    if (!CaptureForTask(image, opts, r)) {
         JsonDoc d;
         d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"read").Bool(L"ok", false);
         d.Int(L"rc", 3).Str(L"error", r.error.empty() ? L"capture failed" : r.error);
@@ -1427,30 +1547,31 @@ static int CmdRead(int argc, wchar_t** argv) {
     JsonDoc d;
     d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"read").Bool(L"ok", count > 0);
     d.Str(L"find", needle).Str(L"text", text).Int(L"count", count);
+    d.Bool(L"fast", opts.fast).Int(L"ms", (long long)(GetTickCount() - t0));
     d.Raw(L"lines", lines);
     if (!learn.empty()) d.Raw(L"learn", learn);
     wprintf(L"%ls\n", d.Emit().c_str());
     return count > 0 ? 0 : 1;
 }
 
-static bool ScreenHasText(const std::wstring& needle) {
-    OcrRequest req;
-    req.merge = true;
-    OcrResult r = EyeRecognize(req);
-    return r.ok && !SieveFind(r.lines, needle, 1).empty();
+static bool ScreenHasText(const std::wstring& needle, const TaskOptions& opts) {
+    OcrResult r;
+    if (!CaptureForTask(L"", opts, r)) return false;
+    return !SieveFind(r.lines, needle, 1).empty();
 }
 
-static int VerifyExpect(const std::wstring& expectText, const std::wstring& expectGone, int timeoutMs) {
+static int VerifyExpect(const std::wstring& expectText, const std::wstring& expectGone,
+                        int timeoutMs, const TaskOptions& opts) {
     if (expectText.empty() && expectGone.empty()) return 0;
     if (timeoutMs <= 0) timeoutMs = 3000;
     DWORD start = GetTickCount();
     for (;;) {
         bool ok = true;
-        if (!expectText.empty()) ok = ok && ScreenHasText(expectText);
-        if (!expectGone.empty()) ok = ok && !ScreenHasText(expectGone);
+        if (!expectText.empty()) ok = ok && ScreenHasText(expectText, opts);
+        if (!expectGone.empty()) ok = ok && !ScreenHasText(expectGone, opts);
         if (ok) return 0;
         if ((int)(GetTickCount() - start) > timeoutMs) return 5;
-        Sleep(250);
+        Sleep(opts.interval);
     }
 }
 
@@ -1463,6 +1584,11 @@ static int CmdClickText(int argc, wchar_t** argv) {
         wprintf(L"%ls\n", d.Emit().c_str());
         return 1;
     }
+    TaskOptions opts;
+    std::wstring optErr;
+    if (!ParseTaskOptions(argc, argv, opts, optErr)) return TaskOptionError(L"click-text", optErr);
+
+    DWORD t0 = GetTickCount();
     int index = _wtoi(GetOpt(argc, argv, L"--index").c_str());
     bool right = GetFlag(argc, argv, L"--right");
     bool dry = GetFlag(argc, argv, L"--dry-run");
@@ -1475,7 +1601,7 @@ static int CmdClickText(int argc, wchar_t** argv) {
     bool found = false;
     std::wstring via;
 
-    if (image.empty() && UiInit()) {
+    if (image.empty() && !opts.fast && !opts.hasRegion && UiInit()) {
         auto nodes = UiFind(needle, 300, 400);
         std::vector<UiNode> usable;
         for (const auto& n : nodes) {
@@ -1502,7 +1628,7 @@ static int CmdClickText(int argc, wchar_t** argv) {
 
     if (!found) {
         OcrResult r;
-        if (!CaptureForTask(image, r)) {
+        if (!CaptureForTask(image, opts, r)) {
             JsonDoc d;
             d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"click-text").Bool(L"ok", false);
             d.Int(L"rc", 3).Str(L"error", r.error.empty() ? L"capture failed" : r.error);
@@ -1535,7 +1661,7 @@ static int CmdClickText(int argc, wchar_t** argv) {
     }
 
     int verifyRc = 0;
-    if (!dry) verifyRc = VerifyExpect(expectText, expectGone, expectTimeout);
+    if (!dry) verifyRc = VerifyExpect(expectText, expectGone, expectTimeout, opts);
 
     std::wstring learn = (!dry && verifyRc == 0)
                              ? RecordRepeat(L"click-text", needle, L"")
@@ -1545,6 +1671,7 @@ static int CmdClickText(int argc, wchar_t** argv) {
     d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"click-text");
     d.Bool(L"ok", verifyRc == 0).Str(L"text", needle).Str(L"via", via);
     d.Int(L"x", x).Int(L"y", y).Bool(L"clicked", !dry && image.empty());
+    d.Bool(L"fast", opts.fast).Int(L"ms", (long long)(GetTickCount() - t0));
     if (!learn.empty()) d.Raw(L"learn", learn);
     if (verifyRc != 0) d.Int(L"rc", verifyRc).Str(L"error", L"expect failed");
     wprintf(L"%ls\n", d.Emit().c_str());
@@ -1560,18 +1687,23 @@ static int CmdWait(int argc, wchar_t** argv) {
         wprintf(L"%ls\n", d.Emit().c_str());
         return 1;
     }
+    TaskOptions opts;
+    std::wstring optErr;
+    if (!ParseTaskOptions(argc, argv, opts, optErr)) return TaskOptionError(L"wait", optErr);
+
     bool gone = GetFlag(argc, argv, L"--gone");
     int timeout = _wtoi(GetOpt(argc, argv, L"--timeout").c_str());
     if (timeout <= 0) timeout = 5000;
 
     DWORD start = GetTickCount();
     for (;;) {
-        bool found = ScreenHasText(needle);
+        OcrResult r;
+        bool found = CaptureForTask(L"", opts, r) && !SieveFind(r.lines, needle, 1).empty();
         if (gone ? !found : found) {
             JsonDoc d;
             d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"wait").Bool(L"ok", true);
             d.Str(L"text", needle).Bool(L"gone", gone);
-            d.Int(L"ms", (long long)(GetTickCount() - start));
+            d.Bool(L"fast", opts.fast).Int(L"ms", (long long)(GetTickCount() - start));
             wprintf(L"%ls\n", d.Emit().c_str());
             return 0;
         }
@@ -1580,10 +1712,11 @@ static int CmdWait(int argc, wchar_t** argv) {
             d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"wait").Bool(L"ok", false);
             d.Str(L"text", needle).Bool(L"gone", gone);
             d.Int(L"rc", 4).Str(L"error", L"timeout");
+            d.Bool(L"fast", opts.fast).Int(L"ms", (long long)(GetTickCount() - start));
             wprintf(L"%ls\n", d.Emit().c_str());
             return 4;
         }
-        Sleep(250);
+        Sleep(opts.interval);
     }
 }
 
@@ -1632,6 +1765,13 @@ static int CmdWords(int argc, wchar_t** argv) {
             JsonDoc d;
             d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"words.accept").Bool(L"ok", false);
             d.Int(L"rc", 1).Str(L"error", L"fingerprint not found");
+            wprintf(L"%ls\n", d.Emit().c_str());
+            return 1;
+        }
+        if (hit->state != L"proposed") {
+            JsonDoc d;
+            d.Str(L"v", L"1").Str(L"tool", L"yx").Str(L"op", L"words.accept").Bool(L"ok", false);
+            d.Int(L"rc", 1).Str(L"error", L"only proposed fingerprints can be accepted");
             wprintf(L"%ls\n", d.Emit().c_str());
             return 1;
         }
@@ -1863,13 +2003,13 @@ static void PrintUsage() {
     wprintf(L"给 AI 用的观测层：把电脑的真实翻译成 AI 能消化的视图。\n\n");
     wprintf(L"  yx serve                          常驻，监听 %ls\n", PipeName().c_str());
     wprintf(L"  yx status                         问常驻进程要状态（没开就本地回一份）\n");
-    wprintf(L"  yx framing [--level L0|L1|L2]     取一帧；默认 L0\n");
+    wprintf(L"  yx framing [--level L0|L1|L2] [--fast]  取一帧；默认 L0\n");
     wprintf(L"  yx zoom --ref <ref>               按 ref 回 L2，不重新截屏\n");
     wprintf(L"  yx open <中文名|URL>              打开设置/工具；URL 直接打开\n");
-    wprintf(L"  yx find <文字>                    找文字，返回坐标和分数\n");
-    wprintf(L"  yx read --find <文字>             只回命中行和后面几行\n");
+    wprintf(L"  yx find <文字> [--fast] [--region x,y,w,h]  找文字\n");
+    wprintf(L"  yx read --find <文字>             只回命中行和附近行\n");
     wprintf(L"  yx click-text <文字>              找到就点，可加 --expect\n");
-    wprintf(L"  yx wait <文字> [--gone]           等文字出现/消失\n");
+    wprintf(L"  yx wait <文字> [--gone] [--interval ms]  等文字出现/消失\n");
     wprintf(L"  yx words [--json]                 列出 Windows 命令词\n");
     wprintf(L"  yx words pending                  看重复记忆的待确认词\n");
     wprintf(L"  yx words accept <fp> <name>       确认一个学习词\n");

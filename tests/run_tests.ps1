@@ -1,4 +1,5 @@
 ﻿$ErrorActionPreference = 'Stop'
+$env:YX_NO_LEARN = '1'
 
 $root = Split-Path $PSScriptRoot -Parent
 $yx   = Join-Path $root 'yx.exe'
@@ -118,6 +119,19 @@ Write-Host '15. click text through click'
 $click2 = Invoke-Json $yx @('click', 'YX', '--image', $sample, '--dry-run')
 Assert-True ($click2.op -eq 'click-text') 'click did not route to click-text'
 Assert-True ($click2.clicked -eq $false) 'click dry-run clicked anyway'
+
+Write-Host '16. fast mode and region validation'
+$fast = Invoke-Json $yx @('find', 'YX', '--image', $sample, '--fast')
+Assert-True ($fast.ok -eq $true) 'fast find failed'
+Assert-True ($fast.fast -eq $true) 'fast flag not reported'
+$fastRead = Invoke-Json $yx @('read', '--find', '123', '--image', $sample, '--fast')
+Assert-True ($fastRead.ok -eq $true) 'fast read failed'
+Assert-True ($fastRead.ms -ge 0) 'fast read missing ms'
+$badRegion = Invoke-Json $yx @('find', 'YX', '--image', $sample, '--region', '1,2')
+Assert-True ($badRegion.rc -eq 1) 'bad region was not rejected'
+$fastFrame = Invoke-Json $yx @('framing', '--level', 'L0', '--fast')
+Assert-True ($fastFrame.ok -eq $true) 'fast framing failed'
+Assert-True ($fastFrame.fast -eq $true) 'framing fast flag not reported'
 
 Write-Host ''
 Write-Host 'ALL TESTS PASSED'

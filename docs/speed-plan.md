@@ -1,4 +1,7 @@
-# 提速方案（未实施，留到下周）
+# 提速方案（v0.7.0 已实施第一版）
+
+状态：2026-10-23。`--region`、`--fast`、`wait --interval`、`framing --fast`、耗时字段、
+Job 超时生命周期修复已落地；`--max-age` 帧复用留到下一版。
 
 目标：把两件事同时提速，不扩架构、不做大项目。
 
@@ -14,13 +17,13 @@
 
 现在 `framing / find / read / click-text / wait` 都是全屏 OCR，约 400ms 一次。
 
-计划加：
+已加：
 
 - `--region x,y,w,h`：只识别目标区域。
 - `--fast`：单路 OCR（中文 1x），跳过 UIA 和英文第二遍。
 - `wait --interval <ms>`：默认 500ms，不再 250ms 全屏轮询。
 - `framing --fast`：L0 只走单路 OCR，跳过 UIA。
-- 先测 JSON 里的 `ms`，只优化真正的大头；不追 GPU。
+- JSON 里的 `ms` / `ocr_ms` / `uia_ms`：先测再优化；不追 GPU。
 
 预期：全屏约 400ms，缩区域或 fast 后约 100 到 200ms。
 
@@ -28,11 +31,11 @@
 
 - 用 `tests/corpus/sample.png` 做固定样本，不依赖当前屏幕。
 - 对比 `find` / `read` / `click-text --dry-run` 在默认、`--fast`、`--region` 下的 `ms`。
-- 现有 15 项测试继续全过。
+- 现有 16 项测试继续全过。
 
 ## 四、暂不做
 
 - 不改成多线程 OCR/UIA。
-- 不做服务端自动缓存（先不引入陈旧风险）。
+- 不做服务端自动缓存；`--max-age` 留到下一版。
 - 不换 OCR 引擎，不加 GPU。
-- 不改词表、重复记忆和账本的现有行为。
+- 不改词表结构、重复记忆策略和账本格式。

@@ -18,16 +18,20 @@ yx help <词>
 
 ```powershell
 yx framing --level L0          # 一句话：窗口/对话框、可操作项、状态
+yx framing --level L0 --fast   # 跳过 UIA、单路 OCR；约 200ms
 yx framing --level L1          # 区块 + 控件 + 粗位置
 yx framing --level L2          # 原始 OCR 行 + UIA + 窗口
 yx zoom --ref <ref>            # 回 L2，不重新截屏
 yx find 余额                   # 命中文字 + 坐标 + 分数
 yx read --find 余额            # 只回命中行和附近行，读具体值用这个
+yx read --find 余额 --fast --region 300,300,800,300   # 只盯一块区域，快
 ```
 
 - `read --find` 比 `framing L0` 更适合读余额、错误码、状态值。
 - 目标窗口不在前台时，先 `yx focus "<标题片段>"`。
 - 复杂界面先 L0，再 `zoom`，不要一上来 L2 全量。
+- `--fast` 只跑中文单路 OCR，会牺牲英文和数字精度；`--region` 会漏掉区域外文字。两者都是显式选项，默认仍走准确路径。
+- 结果里的 `ms` 是这次调用耗时，`ocr_ms` / `uia_ms` 是分项；慢的时候先看这个。
 
 ## 做
 
@@ -38,6 +42,7 @@ yx click 保存 --expect "已保存"        # 点完等文字出现
 yx click 保存 --expect-gone "保存"     # 点完等文字消失
 yx wait "完成" --timeout 10000         # 等文字出现
 yx wait "正在处理" --gone              # 等文字消失
+yx wait "完成" --timeout 10000 --interval 500 --fast   # 快轮询，单路 OCR
 yx open 设备管理器                     # 中文名/URL/路径都能开
 yx run devmgmt                         # 打开设备管理器
 yx run ipconfig                        # 跑只读命令，stdout 在 JSON 里

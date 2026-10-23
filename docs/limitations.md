@@ -1,4 +1,4 @@
-# Known limitations (v0.6)
+# Known limitations (v0.7)
 
 This is a small, local tool. It is not a production security product.
 
@@ -43,6 +43,18 @@ This is a small, local tool. It is not a production security product.
   times out after 30 seconds. A non-zero exit code is reported as-is; it does
   not always mean the command is broken.
 - There is no argument substitution. Words are fixed commands, not templates.
+
+## Fast mode
+
+- `--fast` runs Chinese 1x OCR only and skips the English second pass; it is
+  worse on Latin text and numbers.
+- `--fast` on `find` / `click-text` / `framing` also skips UIA; custom controls
+  that only exist in the accessibility tree may disappear.
+- `--region` ignores everything outside the rectangle. If the target moves out,
+  the command will not see it.
+- `wait --interval` can miss short-lived text between polls. `--fast` makes OCR
+  cheaper but not more accurate.
+- Fast mode is opt-in; the default path keeps the old behavior.
 
 ## Input fuzzification
 

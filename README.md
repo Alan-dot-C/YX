@@ -16,11 +16,14 @@
 ## 现在能做什么
 
 - `yx framing --level L0|L1|L2`：取一帧，按级别给视图
+- `yx framing --fast`：跳过 UIA、单路 OCR，约 200ms
 - `yx zoom --ref <ref>`：按引用回 L2，不重新截屏
 - `yx find <文字>`：找文字，返回坐标和分数
+- `yx find <文字> --fast --region x,y,w,h`：只认一块区域，更快
 - `yx read --find <文字>`：只回命中行和附近几行，适合读余额/错误/状态
+- `yx read --find <文字> --fast`：单路 OCR，读值更快
 - `yx click-text <文字>`：找到就点，可加 `--expect` / `--expect-gone` 验结果
-- `yx wait <文字>`：等文字出现，`--gone` 等它消失
+- `yx wait <文字>`：等文字出现，`--gone` 等它消失，`--interval` 调轮询
 - `yx status`：服务在不在、版本、管道、数据目录
 - `yx words` / `yx words --json`：列出 30+ 个常用 Windows 命令词
 - `yx words pending / accept / reject`：重复记忆——同一动作第 5 次成功会提议一个词
@@ -124,7 +127,7 @@ AI 不能自己确认；`accept` 必须由人执行。`reject` 后同一指纹�
 ## 现在不做
 
 文本压缩、AI 自动生成/确认词表、复杂记忆（分层/遗忘）、托盘、本地 HTTP、GPU OCR、账本的 HMAC/外部锚。
-这些以后再说，v0.6 先把“一个 exe、能看见、能点、能查、能定点读、能记习惯、能听中文”做稳。
+这些以后再说，v0.7 先把“一个 exe、能看见、能点、能查、能定点读、能记习惯、能听中文、能快”做稳。
 
 ## 一个程序，两层
 
